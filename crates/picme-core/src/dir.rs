@@ -53,6 +53,84 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
     Ok(pair_live_photos(entries))
 }
 
+/// Insere `entry` a sa place dans une liste triee par `list` ; rend son index.
+pub fn insert_sorted(entries: &mut Vec<Entry>, entry: Entry) -> usize {
+    let name = file_name(&entry.path);
+    let i = entries.partition_point(|e| natural_cmp(&file_name(&e.path), &name) == Ordering::Less);
+    entries.insert(i, entry);
+    i
+}
+
+/// Ce que `reconcile` a change dans la liste.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Entrees retirees, avec l'index qu'elles occupaient au moment du retrait.
+    pub removed: Vec<(usize, Entry)>,
+    /// Anciennes versions des entrees dont le fichier a change (mtime ou taille) : leurs cles de cache sont perimees.
+    pub updated: Vec<Entry>,
+    /// La liste a change d'une facon ou d'une autre (insertion, retrait, modification, `.mov` de Live Photo).
+    pub changed: bool,
+}
+
+/// Remet la liste (issue de `list` sur le dossier de `path`) en accord avec l'etat disque de `path`, par un seul stat.
+/// Idempotent : un second appel sans changement sur le disque ne fait rien. Memes regles que `list` : fichiers
+/// caches ignores, un `.mov` rejoint l'image de meme stem (Live Photo), et redevient une video seule si l'image part.
+pub fn reconcile(entries: &mut Vec<Entry>, path: &Path) -> Reconciled {
+    let mut out = Reconciled::default();
+    let now = stat_entry(path);
+    if let Some(i) = entries.iter().position(|e| e.path == path) {
+        match now {
+            None => {
+                let old = entries.remove(i);
+                // le .mov d'une Live Photo dont l'image a disparu redevient une entree a part entiere
+                if let Some(mov) = old.live_mov.as_deref().and_then(stat_entry) {
+                    insert_sorted(entries, mov);
+                }
+                out.removed.push((i, old));
+                out.changed = true;
+            }
+            Some(new) if (new.mtime_ns, new.size) != (entries[i].mtime_ns, entries[i].size) => {
+                let live_mov = entries[i].live_mov.take();
+                let old = std::mem::replace(&mut entries[i], Entry { live_mov, ..new });
+                out.updated.push(Entry { live_mov: None, ..old });
+                out.changed = true;
+            }
+            Some(_) => {}
+        }
+        return out;
+    }
+    if let Some(i) = entries.iter().position(|e| e.live_mov.as_deref() == Some(path)) {
+        // le .mov d'une Live Photo : seule sa disparition change la liste
+        if now.is_none() {
+            entries[i].live_mov = None;
+            out.changed = true;
+        }
+        return out;
+    }
+    let Some(mut new) = now else { return out };
+    if path.file_name().is_none_or(|n| n.as_encoded_bytes().starts_with(b".")) {
+        return out;
+    }
+    let stem = stem_key(path);
+    if is_mov(&new) && new.kind == MediaKind::Video {
+        if let Some(img) = entries.iter_mut().find(|e| e.kind != MediaKind::Video && e.live_mov.is_none() && stem_key(&e.path) == stem) {
+            img.live_mov = Some(new.path);
+            out.changed = true;
+            return out;
+        }
+    } else if new.kind != MediaKind::Video
+        && let Some(j) = entries.iter().position(|e| is_mov(e) && e.kind == MediaKind::Video && stem_key(&e.path) == stem)
+    {
+        // l'image arrive apres son .mov : la video seule devient la partie animee de la Live Photo
+        let mov = entries.remove(j);
+        new.live_mov = Some(mov.path.clone());
+        out.removed.push((j, mov));
+    }
+    insert_sorted(entries, new);
+    out.changed = true;
+    out
+}
+
 fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
@@ -181,6 +259,106 @@ mod tests {
         assert_eq!(by_name("solo.mov").live_mov, None);
         assert_eq!(by_name("IMG_2.JPG").size, 1);
         assert!(by_name("IMG_2.JPG").mtime_ns > 0);
+    }
+
+    fn names(list: &[Entry]) -> Vec<String> {
+        list.iter().map(|e| file_name(&e.path)).collect()
+    }
+
+    /// Change le mtime de `p` (sans attendre une seconde) pour simuler une reecriture.
+    fn touch_later(p: &Path) {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        let t = f.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(10);
+        f.set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn insert_sorted_keeps_the_natural_order() {
+        let dir = TmpDir::new("dir-insert");
+        let mut v = Vec::new();
+        for name in ["img10.jpg", "img2.jpg", "IMG1.jpg", "img3.jpg"] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, b"x").unwrap();
+            insert_sorted(&mut v, stat_entry(&p).unwrap());
+        }
+        assert_eq!(names(&v), ["IMG1.jpg", "img2.jpg", "img3.jpg", "img10.jpg"]);
+    }
+
+    #[test]
+    fn reconcile_inserts_updates_and_removes_idempotently() {
+        let dir = TmpDir::new("dir-reconcile");
+        for name in ["a1.jpg", "a3.jpg"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let mut v = list(dir.path()).unwrap();
+        let p = |n: &str| dir.path().join(n);
+
+        // nouveau fichier : insere a sa place
+        std::fs::write(p("a2.jpg"), b"xy").unwrap();
+        let r = reconcile(&mut v, &p("a2.jpg"));
+        assert!(r.changed && r.removed.is_empty() && r.updated.is_empty());
+        assert_eq!(names(&v), ["a1.jpg", "a2.jpg", "a3.jpg"]);
+        assert_eq!(reconcile(&mut v, &p("a2.jpg")), Reconciled::default(), "second appel : rien");
+
+        // modifie : l'ancienne version est rendue, l'entree garde sa place
+        let before = v[1].clone();
+        touch_later(&p("a2.jpg"));
+        let r = reconcile(&mut v, &p("a2.jpg"));
+        assert_eq!(r.updated, std::slice::from_ref(&before));
+        assert!(r.changed && v[1].mtime_ns > before.mtime_ns);
+        assert_eq!(reconcile(&mut v, &p("a2.jpg")), Reconciled::default());
+
+        // disparu : retire, avec son index
+        std::fs::remove_file(p("a2.jpg")).unwrap();
+        let r = reconcile(&mut v, &p("a2.jpg"));
+        assert_eq!(r.removed.len(), 1);
+        assert_eq!((r.removed[0].0, file_name(&r.removed[0].1.path)), (1, "a2.jpg".to_string()));
+        assert_eq!(names(&v), ["a1.jpg", "a3.jpg"]);
+        assert_eq!(reconcile(&mut v, &p("a2.jpg")), Reconciled::default());
+
+        // caches, non medias et absents : ignores
+        std::fs::write(p(".h.jpg"), b"x").unwrap();
+        std::fs::write(p("n.txt"), b"x").unwrap();
+        for n in [".h.jpg", "n.txt", "absent.jpg"] {
+            assert_eq!(reconcile(&mut v, &p(n)), Reconciled::default(), "{n}");
+        }
+        assert_eq!(names(&v), ["a1.jpg", "a3.jpg"]);
+    }
+
+    #[test]
+    fn reconcile_follows_live_photo_pairs() {
+        let dir = TmpDir::new("dir-reconcile-live");
+        let p = |n: &str| dir.path().join(n);
+        std::fs::write(p("IMG_1.HEIC"), b"x").unwrap();
+        let mut v = list(dir.path()).unwrap();
+
+        // le .mov arrive apres l'image : rattache, pas d'entree en plus
+        std::fs::write(p("IMG_1.MOV"), b"x").unwrap();
+        assert!(reconcile(&mut v, &p("IMG_1.MOV")).changed);
+        assert_eq!(names(&v), ["IMG_1.HEIC"]);
+        assert_eq!(v[0].live_mov.as_deref(), Some(p("IMG_1.MOV").as_path()));
+        assert_eq!(reconcile(&mut v, &p("IMG_1.MOV")), Reconciled::default());
+
+        // le .mov part : l'image reste, sans live_mov
+        std::fs::remove_file(p("IMG_1.MOV")).unwrap();
+        assert!(reconcile(&mut v, &p("IMG_1.MOV")).changed);
+        assert_eq!((names(&v), v[0].live_mov.clone()), (vec!["IMG_1.HEIC".to_string()], None));
+
+        // l'image part avec un .mov toujours present : le .mov redevient une video seule
+        std::fs::write(p("IMG_1.MOV"), b"x").unwrap();
+        reconcile(&mut v, &p("IMG_1.MOV"));
+        std::fs::remove_file(p("IMG_1.HEIC")).unwrap();
+        let r = reconcile(&mut v, &p("IMG_1.HEIC"));
+        assert_eq!(r.removed.len(), 1);
+        assert_eq!(names(&v), ["IMG_1.MOV"]);
+        assert_eq!(v[0].kind, MediaKind::Video);
+
+        // l'image revient apres son .mov : la video seule est absorbee, comme le ferait `list`
+        std::fs::write(p("IMG_1.HEIC"), b"x").unwrap();
+        let r = reconcile(&mut v, &p("IMG_1.HEIC"));
+        assert_eq!(r.removed.len(), 1, "la video seule quitte la liste");
+        assert_eq!(names(&v), ["IMG_1.HEIC"]);
+        assert_eq!(v, list(dir.path()).unwrap(), "meme resultat qu'un nouveau listing");
     }
 
     #[test]
