@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=picme
+GenericName=Visionneuse d'images
+Comment=Visionneuse d'images et de videos : photos, Live Photos, HEIC, AVIF, JPEG XL
+Exec=picme %f
+Icon=image-x-generic
+Terminal=false
+NoDisplay=false
+Categories=Graphics;Viewer;GTK;
+MimeType=image/jpeg;image/png;image/webp;image/tiff;image/heif;image/heic;image/avif;image/jxl;image/x-adobe-dng;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-nikon-nrw;image/x-sony-arw;image/x-olympus-orf;image/x-panasonic-rw2;image/x-fuji-raf;image/x-pentax-pef;image/x-samsung-srw;video/mp4;video/quicktime;video/x-m4v;video/x-matroska;video/webm;video/x-msvideo;video/3gpp;
