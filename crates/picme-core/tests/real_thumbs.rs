@@ -17,8 +17,11 @@ fn real_root() -> Option<PathBuf> {
     root.is_dir().then_some(root)
 }
 
-/// (chemin du PNG, dimensions, chunks tEXt) de chaque miniature de `<root>/<dir>`.
-fn thumbnails(root: &Path, dir: &str) -> Vec<(PathBuf, (u32, u32), Vec<(String, String)>)> {
+/// Chemin du PNG, dimensions et chunks tEXt d'une miniature.
+type Thumbnail = (PathBuf, (u32, u32), Vec<(String, String)>);
+
+/// Chaque miniature de `<root>/<dir>`.
+fn thumbnails(root: &Path, dir: &str) -> Vec<Thumbnail> {
     let Ok(read) = std::fs::read_dir(root.join(dir)) else { return Vec::new() };
     let mut out = Vec::new();
     for e in read.flatten() {
