@@ -76,7 +76,7 @@ Depuis picme : glisser l'image courante vers un file manager ou une autre applic
 
 Conflit avec le déplacement de l'image : quand l'image est ajustée à la fenêtre, le glisser emporte le fichier. Quand elle dépasse la fenêtre (zoom), le glisser la déplace (pan) et **Maj+glisser** emporte le fichier. Le glisser depuis le filmstrip n'est pas pris en charge.
 
-Vers picme : déposer un fichier sur la fenêtre l'ouvre et son dossier devient le dossier courant. Le fichier n'est qu'ouvert, jamais déplacé ni supprimé chez la source. Un glisser parti de la même fenêtre est ignoré.
+Vers picme : déposer un fichier sur la fenêtre l'ouvre et son dossier devient le dossier courant. picme n'ouvre que le fichier : il ne le déplace ni ne le supprime, et la source ne le perd que si elle le déplace elle-même. Un glisser parti de la même fenêtre est ignoré.
 
 ## Compilation
 
