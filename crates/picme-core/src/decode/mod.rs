@@ -51,6 +51,9 @@ pub struct Frame {
     pub h: u32,
     pub full_w: u32,
     pub full_h: u32,
+    /// Vrai pour une miniature de cache plus petite que ce qui etait demande alors que l'image a plus de pixels :
+    /// elle n'est jamais agrandie, c'est l'affichage qui l'etire. Toujours faux pour un decode.
+    pub low_res: bool,
 }
 
 impl Frame {
@@ -66,7 +69,25 @@ impl Frame {
             return Ok(self);
         }
         let rgba = resize::resize_rgba(self.rgba, self.w, self.h, nw, nh, true)?;
-        Ok(Frame { rgba, w: nw, h: nh, full_w: self.full_w, full_h: self.full_h })
+        Ok(Frame { rgba, w: nw, h: nh, full_w: self.full_w, full_h: self.full_h, low_res: self.low_res })
+    }
+}
+
+/// Memes proportions, a l'arrondi d'un pixel de la petite image pres.
+pub(crate) fn ratio_matches(w: u32, h: u32, full_w: u32, full_h: u32) -> bool {
+    let (a, b) = (w as u64 * full_h as u64, h as u64 * full_w as u64);
+    a.abs_diff(b) <= full_w.max(full_h) as u64
+}
+
+/// Dimensions de l'image entiere, orientation appliquee (celles de `Frame::full_w` et `full_h`), lues dans l'en-tete
+/// sans decoder les pixels. `None` si le format n'en donne pas a bon compte (JXL, RAW, video) ou si le fichier est
+/// illisible.
+pub fn probe_dims(path: &Path) -> Option<(u32, u32)> {
+    match media::detect(path)? {
+        MediaKind::Jpeg => jpeg::probe(path),
+        kind @ (MediaKind::Png | MediaKind::Webp | MediaKind::Tiff) => raster::probe(path, kind),
+        MediaKind::Heif => heif::probe(path),
+        MediaKind::Jxl | MediaKind::Raw | MediaKind::Video => None,
     }
 }
 
@@ -135,7 +156,7 @@ impl Plan {
     fn finish(&self, rgba: Vec<u8>, w: u32, h: u32, has_alpha: bool, orient: Orientation) -> Result<Frame> {
         let rgba = resize::resize_rgba(rgba, w, h, self.stored_w, self.stored_h, has_alpha)?;
         let (rgba, w, h) = orient.apply_rgba(rgba, self.stored_w, self.stored_h);
-        Ok(Frame { rgba, w, h, full_w: self.full_w, full_h: self.full_h })
+        Ok(Frame { rgba, w, h, full_w: self.full_w, full_h: self.full_h, low_res: false })
     }
 }
 
@@ -272,7 +293,7 @@ mod tests {
         assert_eq!((small.w, small.h), (80, 60));
         let full = decode(&fx("a.jpg"), Target::Full).unwrap();
         let reduced = resize::resize_rgba(full.rgba.clone(), 640, 480, 80, 60, false).unwrap();
-        let reduced = Frame { rgba: reduced, w: 80, h: 60, full_w: 640, full_h: 480 };
+        let reduced = Frame { rgba: reduced, w: 80, h: 60, full_w: 640, full_h: 480, low_res: false };
         let d = mean_abs_diff(&small, &reduced);
         assert!(d < 6.0, "ecart moyen {d}");
     }
@@ -320,6 +341,35 @@ mod tests {
         assert_eq!((f.w, f.h, f.full_w, f.full_h), (320, 240, 640, 480));
         let f = decode_capped(&fx("d.png"), Target::Full, 640 * 480).unwrap();
         assert_eq!((f.w, f.h), (320, 240));
+    }
+
+    #[test]
+    fn probe_dims_matches_the_full_size_of_a_decode_without_decoding() {
+        // orient6 : tournee de 90 degres, les dimensions sont celles de l'affichage ; heic/avif : irot de libheif
+        for name in ["a.jpg", "b_333x217.jpg", "c_orient6.jpg", "d.png", "e.tiff", "f.webp", "g.heic", "h.avif", "k_thumb.heic"] {
+            let f = decode(&fx(name), Target::Preview).unwrap();
+            assert_eq!(probe_dims(&fx(name)), Some((f.full_w, f.full_h)), "{name}");
+        }
+        // pas d'en-tete a bon compte : JXL, video ; fichier absent ou inconnu
+        assert_eq!(probe_dims(&fx("i.jxl")), None);
+        assert_eq!(probe_dims(&fx("j.mov")), None);
+        assert_eq!(probe_dims(&fx("absent.jpg")), None);
+    }
+
+    #[test]
+    fn probe_dims_reads_a_jpeg_whose_header_is_past_the_first_64_kib() {
+        // gros APP2 avant le SOF : le fichier est relu en entier
+        let dir = crate::testutil::TmpDir::new("decode-probe-big");
+        let src = std::fs::read(fx("a.jpg")).unwrap();
+        let mut out = src[..2].to_vec(); // SOI
+        let pad = vec![0u8; 65_500];
+        out.extend_from_slice(&[0xFF, 0xE2]);
+        out.extend_from_slice(&(pad.len() as u16 + 2).to_be_bytes());
+        out.extend_from_slice(&pad);
+        out.extend_from_slice(&src[2..]);
+        let p = dir.path().join("big-header.jpg");
+        std::fs::write(&p, &out).unwrap();
+        assert_eq!(probe_dims(&p), Some((640, 480)));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! HEIC et AVIF par libheif. libheif applique lui-meme irot, imir et clap : l'orientation EXIF n'est pas relue.
 
-use super::{Frame, Plan, Target};
+use super::{Frame, Plan, Target, ratio_matches};
 use crate::error::{Error, Result};
 use crate::orient::Orientation;
 use libheif_rs::{ColorSpace, DecodingOptions, HeifContext, ImageHandle, ItemId, LibHeif, RgbChroma};
@@ -36,10 +36,11 @@ pub(super) fn decode(path: &Path, target: Target, max_full_bytes: usize) -> Resu
     Plan::new(w, h, Orientation::Normal, target, max_full_bytes).finish(rgba, w, h, has_alpha, Orientation::Normal)
 }
 
-/// Memes proportions, a l'arrondi d'un pixel de la thumbnail pres.
-fn ratio_matches(w: u32, h: u32, full_w: u32, full_h: u32) -> bool {
-    let (a, b) = (w as u64 * full_h as u64, h as u64 * full_w as u64);
-    a.abs_diff(b) <= full_w.max(full_h) as u64
+/// Dimensions de l'image entiere (irot applique par libheif), lues dans les metadonnees sans decoder les pixels.
+pub(super) fn probe(path: &Path) -> Option<(u32, u32)> {
+    let ctx = HeifContext::read_from_file(path.to_str()?).ok()?;
+    let handle = ctx.primary_image_handle().ok()?;
+    Some((handle.width(), handle.height()))
 }
 
 /// Premiere thumbnail embarquee, decodee telle quelle (buffer, dimensions, alpha). Une thumbnail illisible
