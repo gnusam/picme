@@ -2,7 +2,13 @@
 
 pub mod app;
 pub mod canvas;
+pub mod chrome;
 pub mod fileops;
+pub mod filmstrip;
+pub mod keys;
+pub mod monitor;
+pub mod osd;
+pub mod view;
 
 #[cfg(test)]
 pub(crate) mod testutil {
