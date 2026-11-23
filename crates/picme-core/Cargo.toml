@@ -5,3 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fast_image_resize = "6.2"
+# formats limites a ceux que picme-core decode via `image` (JPEG : turbojpeg, HEIC et AVIF : libheif, JXL : jxl-oxide)
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "webp"] }
+jxl-oxide = { version = "0.12", default-features = false }
+kamadak-exif = "0.6"
+# feature de version = minimum utile, pas la derniere : le poste peut avoir une libheif plus ancienne que le conteneur
+libheif-rs = { version = "3.0", default-features = false, features = ["v1_17"] }
+md-5 = "0.11"
+percent-encoding = "2.3"
+png = "0.18"
+# libjpeg-turbo systeme par pkg-config (pas de cmake ni de build embarque). 0.5 et pas 1.x : la 1.x exige TurboJPEG 3
+# (libturbojpeg >= 3.0), Debian 13 n'a que la 2.1.5. Pas d'API de scaling : on passe une Image plus petite a tjDecompress2.
+turbojpeg = { version = "0.5", default-features = false, features = ["pkg-config", "require-simd"] }
