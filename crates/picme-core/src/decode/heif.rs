@@ -20,14 +20,16 @@ pub(super) fn decode(path: &Path, target: Target, max_full_bytes: usize) -> Resu
     let (full_w, full_h) = (handle.width(), handle.height());
 
     if target == Target::Preview
-        && let Some(mut frame) = embedded_thumbnail(&handle)?
-    {
+        && let Some((rgba, w, h, has_alpha)) = embedded_thumbnail(&handle)
         // une thumbnail dont le ratio differe de l'image est tournee autrement : on ne s'en sert pas
-        if ratio_matches(frame.w, frame.h, full_w, full_h) {
-            frame.full_w = full_w;
-            frame.full_h = full_h;
-            return Ok(frame);
-        }
+        && ratio_matches(w, h, full_w, full_h)
+    {
+        // meme plan que le decode complet : une thumbnail de plus de 256 px (320x240 sur iPhone) est reduite,
+        // une plus petite reste telle quelle (jamais d'agrandissement)
+        let mut frame = Plan::new(w, h, Orientation::Normal, target, max_full_bytes).finish(rgba, w, h, has_alpha, Orientation::Normal)?;
+        frame.full_w = full_w;
+        frame.full_h = full_h;
+        return Ok(frame);
     }
 
     let (rgba, w, h, has_alpha) = decode_handle(&handle)?;
@@ -40,19 +42,14 @@ fn ratio_matches(w: u32, h: u32, full_w: u32, full_h: u32) -> bool {
     a.abs_diff(b) <= full_w.max(full_h) as u64
 }
 
-/// Premiere thumbnail embarquee, decodee telle quelle (`full_w` et `full_h` a corriger par l'appelant).
-fn embedded_thumbnail(handle: &ImageHandle) -> Result<Option<Frame>> {
+/// Premiere thumbnail embarquee, decodee telle quelle (buffer, dimensions, alpha). Une thumbnail illisible
+/// n'est pas une erreur : l'appelant se rabat sur l'image principale.
+fn embedded_thumbnail(handle: &ImageHandle) -> Option<(Vec<u8>, u32, u32, bool)> {
     let mut ids: [ItemId; 1] = [0];
     if handle.thumbnail_ids(&mut ids) == 0 {
-        return Ok(None);
+        return None;
     }
-    let Ok(thumb) = handle.thumbnail(ids[0]) else {
-        return Ok(None);
-    };
-    let Ok((rgba, w, h, _)) = decode_handle(&thumb) else {
-        return Ok(None);
-    };
-    Ok(Some(Frame { rgba, w, h, full_w: w, full_h: h }))
+    decode_handle(&handle.thumbnail(ids[0]).ok()?).ok()
 }
 
 /// Decode en RGBA 8 bits (les 10 bits sont ramenes a 8). Rend le buffer, ses dimensions et la presence d'alpha.

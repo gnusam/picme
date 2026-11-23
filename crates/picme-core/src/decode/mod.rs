@@ -268,6 +268,14 @@ mod tests {
     }
 
     #[test]
+    fn heif_preview_reduces_an_oversized_embedded_thumbnail() {
+        // thumbnail embarquee de 320x240 (cas des iPhone) : reduite a la boite de 256, full_* reste celui de l'image
+        let f = decode(&fx("l_thumb320.heic"), Target::Preview).unwrap();
+        assert_eq!((f.w, f.h, f.full_w, f.full_h), (256, 192, 640, 480));
+        assert!(is_red(px(&f, 5, 5)));
+    }
+
+    #[test]
     fn full_is_reduced_over_the_cap() {
         let f = decode_capped(&fx("a.jpg"), Target::Full, 640 * 480).unwrap();
         assert_eq!((f.w, f.h, f.full_w, f.full_h), (320, 240, 640, 480));

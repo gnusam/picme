@@ -22,9 +22,11 @@ heif-enc -q 80 "$base" -o g.heic
 heif-enc -A -q 50 "$base" -o h.avif
 # HEIC avec thumbnail embarquee de 128 px (branche Preview de decode)
 heif-enc -q 80 -t 128 "$base" -o k_thumb.heic
+# thumbnail de 320 px, plus grande que la boite de Preview (cas des HEIC d'iPhone : 320x240)
+heif-enc -q 80 -t 320 "$base" -o l_thumb320.heic
 cjxl -q 90 "$base" i.jxl
 
 gst-launch-1.0 -q videotestsrc num-buffers=60 ! videoconvert ! avenc_mpeg4 ! qtmux ! filesink location=j.mov
 
 rm -f "$base"
-ls -l a.jpg b_333x217.jpg c_orient6.jpg d.png e.tiff f.webp g.heic k_thumb.heic h.avif i.jxl j.mov
+ls -l a.jpg b_333x217.jpg c_orient6.jpg d.png e.tiff f.webp g.heic k_thumb.heic l_thumb320.heic h.avif i.jxl j.mov

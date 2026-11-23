@@ -50,7 +50,7 @@ mod tests {
 
     /// Fixtures attendues apres `tests/fixtures/make.sh`.
     const FIXTURES: &[&str] = &[
-        "a.jpg", "b_333x217.jpg", "c_orient6.jpg", "d.png", "e.tiff", "f.webp", "g.heic", "h.avif", "i.jxl", "j.mov", "k_thumb.heic",
+        "a.jpg", "b_333x217.jpg", "c_orient6.jpg", "d.png", "e.tiff", "f.webp", "g.heic", "h.avif", "i.jxl", "j.mov", "k_thumb.heic", "l_thumb320.heic",
     ];
 
     #[test]

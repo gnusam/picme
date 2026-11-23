@@ -36,6 +36,18 @@ fn uri_matches_gio_on_awkward_names() {
 }
 
 #[test]
+fn uri_matches_gio_on_non_canonical_paths() {
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_str().unwrap();
+    let relative = ["../x.jpg", "./x.jpg", "x.jpg", "a/../../x.jpg", "../../../../../../../../../../../../x.jpg"];
+    let absolute = ["/a/../b.jpg", "/a/./b.jpg", "/a//b.jpg", "/a/b/", "/../x.jpg", "/a/b/../../../x.jpg", "/a/b/.", "/a/b/.."];
+    for name in absolute.iter().map(|s| s.to_string()).chain(relative.iter().map(|s| s.to_string())) {
+        let p = Path::new(&name);
+        assert_eq!(picme_core::thumbs::uri(p), gio::File::for_path(p).uri().as_str(), "{name} (cwd {cwd})");
+    }
+}
+
+#[test]
 fn uri_matches_gio_on_every_ascii_byte() {
     for b in 1u8..128 {
         if b == b'/' {

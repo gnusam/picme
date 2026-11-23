@@ -14,7 +14,8 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 use std::fmt::Write as _;
 use std::io::{BufReader, Write as _};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Tout est encode sauf les non reserves (`-._~`), `!$&'()*+,=:@` et `/` : le jeu de `g_file_get_uri`, verifie
@@ -42,11 +43,32 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
 /// Ordre de lecture : la plus grande d'abord.
 const SIZE_DIRS: [&str; 2] = ["large", "normal"];
 
-/// URI `file://` d'un chemin absolu (un chemin relatif est rendu absolu sans resoudre les liens symboliques).
-/// Les octets du nom sont encodes tels quels : un nom non UTF-8 reste representable.
+/// URI `file://` d'un chemin. Comme `g_file_new_for_path`, le chemin est rendu absolu (relatif au dossier courant)
+/// puis normalise lexicalement (`.`, `..`, `//`, `/` final), sans resoudre les liens symboliques : le file manager
+/// nomme ses miniatures par cette forme, pas par celle que l'utilisateur a tapee. Les octets du nom sont encodes
+/// tels quels : un nom non UTF-8 reste representable.
 pub fn uri(path: &Path) -> String {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    format!("file://{}", percent_encode(abs.as_os_str().as_encoded_bytes(), PATH_SET))
+    let mut parts: Vec<&OsStr> = Vec::new();
+    for c in abs.components() {
+        match c {
+            Component::Normal(name) => parts.push(name),
+            // `..` au-dessus de la racine reste a la racine
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    let mut bytes = Vec::new();
+    for name in &parts {
+        bytes.push(b'/');
+        bytes.extend_from_slice(name.as_encoded_bytes());
+    }
+    if bytes.is_empty() {
+        bytes.push(b'/');
+    }
+    format!("file://{}", percent_encode(&bytes, PATH_SET))
 }
 
 /// Racine par defaut : `$XDG_CACHE_HOME/thumbnails`, sinon `$HOME/.cache/thumbnails` (valeurs relatives ignorees,
@@ -216,6 +238,17 @@ mod tests {
         // nom non UTF-8 : ses octets sont encodes tels quels
         let raw = std::ffi::OsStr::from_bytes(b"/x/\xff.jpg");
         assert_eq!(uri(Path::new(raw)), "file:///x/%FF.jpg");
+    }
+
+    #[test]
+    fn uri_normalises_lexically_without_following_symlinks() {
+        assert_eq!(uri(Path::new("/a/../b.jpg")), "file:///b.jpg");
+        assert_eq!(uri(Path::new("/a/./b//c.jpg")), "file:///a/b/c.jpg");
+        assert_eq!(uri(Path::new("/../x.jpg")), "file:///x.jpg");
+        assert_eq!(uri(Path::new("/a/b/")), "file:///a/b");
+        assert_eq!(uri(Path::new("/")), "file:///");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(uri(Path::new("x.jpg")), uri(&cwd.join("x.jpg")));
     }
 
     #[test]
