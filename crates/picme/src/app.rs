@@ -760,6 +760,18 @@ mod tests {
         assert!(!r.c.cache.contains(&(Ident::of_key(&p7), Level::Preview)), "Preview d'avance arrive apres le repos : jete");
         assert!(matches!(r.c.settle(), Show::Keep), "deja au repos");
         assert_eq!(r.decode.jobs().len(), 3);
+
+        // touche tenue en bout de dossier : pas de navigation, le repos vient 150 ms apres le dernier deplacement
+        r.c.go(4);
+        r.clock.advance(40);
+        r.c.go(10);
+        assert_eq!(name(&r.c), "i11.jpg");
+        assert!(r.c.repeating());
+        r.clock.advance(100);
+        assert!(matches!(r.c.go(1), Show::Keep));
+        r.clock.advance(50);
+        r.c.settle();
+        assert!(!r.c.repeating());
     }
 
     #[test]
