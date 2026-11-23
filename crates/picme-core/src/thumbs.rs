@@ -17,8 +17,9 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Tout est encode sauf les non reserves (`-._~`), les reserves permis dans un chemin (`!$&'()*+,;=:@`) et `/` :
-/// le jeu de `g_file_get_uri` (G_URI_RESERVED_CHARS_ALLOWED_IN_PATH), verifie contre gio dans `crates/picme`.
+/// Tout est encode sauf les non reserves (`-._~`), `!$&'()*+,=:@` et `/` : le jeu de `g_file_get_uri`, verifie
+/// octet par octet contre gio dans `crates/picme/tests/uri_gio.rs`. `;` est encode (%3B) par gio, bien qu'il soit
+/// un sous-delimiteur permis dans un chemin par la RFC 3986.
 const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'.')
@@ -33,7 +34,6 @@ const PATH_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'*')
     .remove(b'+')
     .remove(b',')
-    .remove(b';')
     .remove(b'=')
     .remove(b':')
     .remove(b'@')
@@ -212,7 +212,7 @@ mod tests {
     fn uri_encodes_like_a_file_uri() {
         assert_eq!(uri(Path::new("/home/jens/photos/me.png")), "file:///home/jens/photos/me.png");
         assert_eq!(uri(Path::new("/a b/é#%?+[x].jpg")), "file:///a%20b/%C3%A9%23%25%3F+%5Bx%5D.jpg");
-        assert_eq!(uri(Path::new("/x/!$&'()*,;=:@~-_.jpg")), "file:///x/!$&'()*,;=:@~-_.jpg");
+        assert_eq!(uri(Path::new("/x/!$&'()*,=:@~-_;.jpg")), "file:///x/!$&'()*,=:@~-_%3B.jpg");
         // nom non UTF-8 : ses octets sont encodes tels quels
         let raw = std::ffi::OsStr::from_bytes(b"/x/\xff.jpg");
         assert_eq!(uri(Path::new(raw)), "file:///x/%FF.jpg");
