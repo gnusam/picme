@@ -1,6 +1,7 @@
 //! Partie GTK de picme, en bibliotheque pour que le controller et ses tests vivent hors de `main.rs`.
 
 pub mod app;
+pub mod canvas;
 pub mod fileops;
 
 #[cfg(test)]
