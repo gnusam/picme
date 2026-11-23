@@ -8,7 +8,7 @@
 use crate::error::{Error, Result};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,36 @@ const MAX_NAME: usize = 200;
 pub struct Staged {
     tmp: PathBuf,
     done: bool,
+}
+
+/// Identite d'un fichier au moment ou on l'a lu : (ino, taille, mtime en ns). Si elle differe juste avant le rename,
+/// un autre programme a reecrit ou remplace le fichier depuis la lecture : le remplacer ferait perdre son travail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seen {
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+}
+
+impl Seen {
+    fn of(meta: &fs::Metadata) -> Self {
+        Seen { ino: meta.ino(), size: meta.len(), mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()) }
+    }
+}
+
+/// Lit `path` en entier et rend aussi son identite, prise sur le descripteur ouvert (le contenu lu et l'identite
+/// rendue sont ceux du meme fichier, meme si un autre programme le remplace pendant la lecture).
+pub fn read(path: &Path) -> Result<(Vec<u8>, Seen)> {
+    let mut file = File::open(path)?;
+    let meta = file.metadata()?;
+    let mut data = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut data)?;
+    // fichier agrandi ou tronque pendant la lecture : le contenu ne correspond plus a l'identite
+    let after = file.metadata()?;
+    if Seen::of(&after) != Seen::of(&meta) {
+        return Err(Error::Invalid(format!("{} a change pendant sa lecture", path.display())));
+    }
+    Ok((data, Seen::of(&meta)))
 }
 
 /// Chemin du temporaire pour `target` : meme dossier (le rename reste sur le meme systeme de fichiers), nom cache
@@ -84,6 +114,16 @@ impl Staged {
         Ok(())
     }
 
+    /// [`Staged::commit`] si `target` est toujours le fichier que `seen` a decrit, sinon `Error::Invalid` sans rien
+    /// remplacer (le temporaire reste pour le drop). Reste une fenetre de quelques microsecondes entre ce controle et
+    /// le rename : rename n'a pas de variante conditionnelle, la fenetre n'est plus celle de toute l'operation.
+    pub fn commit_if_unchanged(&mut self, target: &Path, seen: &Seen) -> Result<()> {
+        if Seen::of(&fs::metadata(target)?) != *seen {
+            return Err(Error::Invalid(format!("{} a change pendant l'operation, rien n'est ecrit", target.display())));
+        }
+        self.commit(target)
+    }
+
     /// Cree `target`, qui ne doit pas exister : lien dur puis suppression du temporaire, ce qui echoue en
     /// `AlreadyExists` sans rien ecraser si un autre programme a pris le nom entre-temps. Sur un systeme de fichiers
     /// sans liens durs, repli sur un rename apres verification (fenetre de course minime).
@@ -137,11 +177,12 @@ pub fn stage_bytes(target: &Path, perms_from: Option<&Path>, bytes: &[u8], check
     })
 }
 
-/// Remplace le fichier existant `path` par `bytes` en gardant ses permissions et son proprietaire. Un lien
-/// symbolique est suivi : c'est le fichier pointe qui est reecrit, le lien reste.
-pub fn replace(path: &Path, bytes: &[u8], check: impl FnOnce(&[u8]) -> Result<()>) -> Result<()> {
+/// Remplace le fichier existant `path`, lu par [`read`] qui a rendu `seen`, par `bytes` en gardant ses permissions et
+/// son proprietaire. Un lien symbolique est suivi : c'est le fichier pointe qui est reecrit, le lien reste. Si le
+/// fichier a change depuis la lecture, rien n'est remplace (`Error::Invalid`).
+pub fn replace(path: &Path, seen: &Seen, bytes: &[u8], check: impl FnOnce(&[u8]) -> Result<()>) -> Result<()> {
     let real = fs::canonicalize(path)?;
-    stage_bytes(&real, Some(&real), bytes, check)?.commit(&real)
+    stage_bytes(&real, Some(&real), bytes, check)?.commit_if_unchanged(&real, seen)
 }
 
 #[cfg(test)]
@@ -157,6 +198,11 @@ mod tests {
         v
     }
 
+    /// Identite de `p` telle que la verrait une lecture a cet instant.
+    fn seen(p: &Path) -> Seen {
+        read(p).unwrap().1
+    }
+
     #[test]
     fn replace_keeps_permissions_and_changes_content() {
         let tmp = TmpDir::new("atomic-ok");
@@ -164,13 +210,13 @@ mod tests {
         fs::write(&p, b"avant").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o640)).unwrap();
         let ino = fs::metadata(&p).unwrap().ino();
-        let mut seen = None;
-        replace(&p, b"apres, plus long", |back| {
-            seen = Some(back.to_vec());
+        let mut checked = None;
+        replace(&p, &seen(&p), b"apres, plus long", |back| {
+            checked = Some(back.to_vec());
             Ok(())
         })
         .unwrap();
-        assert_eq!(seen.as_deref(), Some(&b"apres, plus long"[..]), "check relit le temporaire ecrit");
+        assert_eq!(checked.as_deref(), Some(&b"apres, plus long"[..]), "check relit le temporaire ecrit");
         assert_eq!(fs::read(&p).unwrap(), b"apres, plus long");
         let meta = fs::metadata(&p).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o640);
@@ -186,8 +232,70 @@ mod tests {
         // original date dans le futur : le cas extreme de deux ecritures dans le meme pas d'horloge
         let future = std::time::SystemTime::now() + Duration::from_secs(60);
         File::options().write(true).open(&p).unwrap().set_modified(future).unwrap();
-        replace(&p, b"apres", |_| Ok(())).unwrap();
+        replace(&p, &seen(&p), b"apres", |_| Ok(())).unwrap();
         assert!(fs::metadata(&p).unwrap().modified().unwrap() > future);
+    }
+
+    #[test]
+    fn a_file_rewritten_after_the_read_is_not_replaced() {
+        let tmp = TmpDir::new("atomic-changed");
+        let p = tmp.path().join("x.bin");
+        fs::write(&p, b"avant").unwrap();
+        let (_, before) = read(&p).unwrap();
+        // un autre programme reecrit le fichier entre la lecture et le rename, ici pendant la verification
+        let r = replace(&p, &before, b"resultat de picme", |_| {
+            fs::write(&p, b"travail d'un autre programme").unwrap();
+            Ok(())
+        });
+        assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+        assert_eq!(fs::read(&p).unwrap(), b"travail d'un autre programme", "la reecriture concurrente est intacte");
+        assert!(leftovers(tmp.path()).is_empty(), "temporaire restant : {:?}", leftovers(tmp.path()));
+    }
+
+    #[test]
+    fn a_file_touched_without_a_size_change_is_not_replaced() {
+        let tmp = TmpDir::new("atomic-touched");
+        let p = tmp.path().join("x.bin");
+        fs::write(&p, b"avant").unwrap();
+        let before = seen(&p);
+        // meme taille, meme contenu : seul le mtime bouge
+        File::options().write(true).open(&p).unwrap().set_modified(std::time::SystemTime::now() + Duration::from_secs(5)).unwrap();
+        let r = replace(&p, &before, b"apres", |_| Ok(()));
+        assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+        assert_eq!(fs::read(&p).unwrap(), b"avant");
+        assert!(leftovers(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_file_replaced_by_another_inode_is_not_replaced() {
+        let tmp = TmpDir::new("atomic-inode");
+        let p = tmp.path().join("x.bin");
+        fs::write(&p, b"avant").unwrap();
+        let before = seen(&p);
+        // un editeur sauve par rename : meme taille, meme mtime restitue, autre ino
+        let other = tmp.path().join("autre.bin");
+        fs::write(&other, b"avant").unwrap();
+        File::options().write(true).open(&other).unwrap().set_modified(fs::metadata(&p).unwrap().modified().unwrap()).unwrap();
+        fs::rename(&other, &p).unwrap();
+        let r = replace(&p, &before, b"apres", |_| Ok(()));
+        assert!(matches!(r, Err(Error::Invalid(_))), "{r:?}");
+        assert_eq!(fs::read(&p).unwrap(), b"avant");
+        assert!(leftovers(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn a_target_removed_before_the_rename_is_an_error() {
+        let tmp = TmpDir::new("atomic-gone");
+        let p = tmp.path().join("x.bin");
+        fs::write(&p, b"avant").unwrap();
+        let before = seen(&p);
+        let r = replace(&p, &before, b"apres", |_| {
+            fs::remove_file(&p).unwrap();
+            Ok(())
+        });
+        assert!(r.is_err());
+        assert!(!p.exists(), "le fichier supprime n'est pas recree");
+        assert!(leftovers(tmp.path()).is_empty());
     }
 
     #[test]
@@ -214,7 +322,7 @@ mod tests {
         let tmp = TmpDir::new("atomic-check-fail");
         let p = tmp.path().join("x.bin");
         fs::write(&p, b"original").unwrap();
-        let r = replace(&p, b"resultat invalide", |_| Err(Error::Invalid("dimensions inattendues".into())));
+        let r = replace(&p, &seen(&p), b"resultat invalide", |_| Err(Error::Invalid("dimensions inattendues".into())));
         assert!(matches!(r, Err(Error::Invalid(_))));
         assert_eq!(fs::read(&p).unwrap(), b"original");
         assert!(leftovers(tmp.path()).is_empty());
@@ -271,7 +379,7 @@ mod tests {
         let link = tmp.path().join("link.bin");
         fs::write(&real, b"avant").unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        replace(&link, b"apres", |_| Ok(())).unwrap();
+        replace(&link, &seen(&link), b"apres", |_| Ok(())).unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(fs::read(&real).unwrap(), b"apres");
     }

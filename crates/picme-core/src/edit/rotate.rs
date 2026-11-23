@@ -24,12 +24,18 @@ pub enum Saved {
 }
 
 /// Enregistre la rotation `turn` (`Rotate90` pour R, `Rotate270` pour Shift+R ; toute orientation est acceptee)
-/// de l'image `path`. Atomique : en cas d'erreur l'original est intact.
+/// de l'image `path`. Atomique : en cas d'erreur l'original est intact. Si un autre programme reecrit ou remplace le
+/// fichier entre la lecture et le rename, la rotation est abandonnee (`Error::Invalid`) et sa version est conservee.
 pub fn rotate(path: &Path, turn: Orientation) -> Result<Saved> {
-    let data = std::fs::read(path)?;
+    let (data, seen) = atomic::read(path)?;
+    rotate_data(path, data, &seen, turn)
+}
+
+/// [`rotate`] sur le contenu deja lu (`seen` : son identite, rendue par [`atomic::read`]).
+fn rotate_data(path: &Path, data: Vec<u8>, seen: &atomic::Seen, turn: Orientation) -> Result<Saved> {
     match media::sniff(&data) {
-        Some(MediaKind::Jpeg) => rotate_jpeg(path, data, turn),
-        Some(MediaKind::Png) => rotate_png(path, &data, turn),
+        Some(MediaKind::Jpeg) => rotate_jpeg(path, data, seen, turn),
+        Some(MediaKind::Png) => rotate_png(path, &data, seen, turn),
         Some(kind) => Err(Error::Unsupported(format!("rotation non enregistrable en {kind:?}"))),
         None => Err(Error::Unsupported("format inconnu".into())),
     }
@@ -62,14 +68,14 @@ fn perfect_possible(t: Orientation, w: u32, h: u32, subsamp: Subsamp) -> bool {
     }
 }
 
-fn rotate_jpeg(path: &Path, data: Vec<u8>, turn: Orientation) -> Result<Saved> {
+fn rotate_jpeg(path: &Path, data: Vec<u8>, seen: &atomic::Seen, turn: Orientation) -> Result<Saved> {
     let header = Decompressor::new().map_err(Error::decode)?.read_header(&data).map_err(Error::decode)?;
     let (w, h) = (header.width as u32, header.height as u32);
     let t = Orientation::from_container(&mut Cursor::new(&data)).compose(turn);
     if t == Orientation::Normal || !perfect_possible(t, w, h, header.subsamp) {
         // pixels intacts : la rotation passe dans le tag (et le tag revient a 1 si elle annule l'orientation)
         let out = exif::jpeg_set_orientation(data, t.exif_value()).ok_or_else(|| Error::Unsupported("EXIF illisible ou trop grand pour y ecrire l'orientation".into()))?;
-        atomic::replace(path, &out, |b| check_jpeg(b, w, h, t))?;
+        atomic::replace(path, seen, &out, |b| check_jpeg(b, w, h, t))?;
         return Ok(if t == Orientation::Normal { Saved::Pixels } else { Saved::Tag });
     }
     let tr = Transform { op: op_of(t), perfect: true, ..Transform::default() };
@@ -77,15 +83,15 @@ fn rotate_jpeg(path: &Path, data: Vec<u8>, turn: Orientation) -> Result<Saved> {
     let (dw, dh) = t.displayed_dims(w, h);
     let mut out = exif::jpeg_set_orientation(out, 1).ok_or_else(|| Error::Invalid("tag Orientation impossible a remettre a 1".into()))?;
     exif::jpeg_set_pixel_dims(&mut out, dw, dh);
-    atomic::replace(path, &out, |b| check_jpeg(b, dw, dh, Orientation::Normal))?;
+    atomic::replace(path, seen, &out, |b| check_jpeg(b, dw, dh, Orientation::Normal))?;
     Ok(Saved::Pixels)
 }
 
-fn rotate_png(path: &Path, data: &[u8], turn: Orientation) -> Result<Saved> {
+fn rotate_png(path: &Path, data: &[u8], seen: &atomic::Seen, turn: Orientation) -> Result<Saved> {
     let t = Orientation::from_container(&mut Cursor::new(data)).compose(turn);
     let raw = png::decode(data)?.transformed(t);
     let out = raw.encode(Orientation::Normal, t.swaps_axes())?;
-    atomic::replace(path, &out, |b| raw.check(b, Orientation::Normal))?;
+    atomic::replace(path, seen, &out, |b| raw.check(b, Orientation::Normal))?;
     Ok(Saved::Pixels)
 }
 
@@ -427,9 +433,23 @@ mod tests {
         data.truncate(data.len() / 3);
         fs::write(&p, &data).unwrap();
         let r = rotate(&p, Orientation::Rotate90);
-        assert!(r.is_err() || fs::read(&p).unwrap() != data, "{r:?}");
-        if r.is_err() {
-            assert_eq!(fs::read(&p).unwrap(), data, "original intact");
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(fs::read(&p).unwrap(), data, "original intact");
+        no_temp_left(tmp.path());
+    }
+
+    #[test]
+    fn a_file_rewritten_between_the_read_and_the_rename_is_kept() {
+        let tmp = TmpDir::new("rot-concurrent");
+        for name in ["a.jpg", "d.png"] {
+            let p = copy(&tmp, name);
+            let (data, seen) = atomic::read(&p).unwrap();
+            // un autre programme reecrit le fichier apres notre lecture, avant le rename
+            let theirs = [&b"travail d'un autre programme"[..], name.as_bytes()].concat();
+            fs::write(&p, &theirs).unwrap();
+            let r = rotate_data(&p, data, &seen, Orientation::Rotate90);
+            assert!(matches!(r, Err(Error::Invalid(_))), "{name} : {r:?}");
+            assert_eq!(fs::read(&p).unwrap(), theirs, "{name} : la version de l'autre programme est intacte");
         }
         no_temp_left(tmp.path());
     }
