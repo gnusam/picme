@@ -1,5 +1,6 @@
 //! Coeur de picme, sans dependance GTK : decode, orientation, thumbnails, cache, edition de fichiers.
 
+pub mod decode;
 pub mod dir;
 pub mod error;
 pub mod media;

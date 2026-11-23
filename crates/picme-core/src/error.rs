@@ -15,6 +15,13 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// Erreur de decode a partir de l'erreur d'une lib.
+    pub(crate) fn decode(e: impl fmt::Display) -> Self {
+        Error::Decode(e.to_string())
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
