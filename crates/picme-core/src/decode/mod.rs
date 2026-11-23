@@ -18,16 +18,24 @@ use std::path::Path;
 /// Cote de la boite du `Preview` : celle de la miniature freedesktop `large`.
 pub const PREVIEW_SIZE: u32 = 256;
 
+/// Boite d'une miniature de filmstrip : 96 px de haut, 192 de large au plus (un panorama ne s'etire pas).
+pub const STRIP_W: u32 = 192;
+pub const STRIP_H: u32 = 96;
+
 /// Budget RAM par defaut du cache de textures (`--cache-mb`, 256 Mo). `Full` est reduit au-dela de la moitie.
 pub const DEFAULT_BUDGET_BYTES: usize = 256 << 20;
 
-/// Taille voulue. Dans les trois cas l'image garde ses proportions et n'est jamais agrandie.
+/// Taille voulue. Dans tous les cas l'image garde ses proportions et n'est jamais agrandie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
     /// Premier affichage, le plus vite possible : tient dans `PREVIEW_SIZE` x `PREVIEW_SIZE`. Pour un HEIF,
     /// la thumbnail embarquee si elle existe, donc eventuellement plus petite que la boite (voir `Frame::w`).
     /// Une miniature freedesktop `large` doit venir de `Fit(256, 256)`, pas de `Preview`.
     Preview,
+    /// Miniature du filmstrip : tient dans `STRIP_W` x `STRIP_H`. Cle distincte de `Preview` pour que les resultats
+    /// du filmstrip et ceux du controller ne se melangent pas dans le pool `thumbs` ; le travail du pool la tire de
+    /// la miniature freedesktop (`Frame::shrink_to`), `decode` la sait aussi produire directement.
+    Strip,
     /// Tient dans une fenetre de `w` x `h` pixels (device pixels).
     Fit(u32, u32),
     /// Pleine resolution, reduite si elle depasse la moitie du budget (voir `decode_capped`).
@@ -49,6 +57,16 @@ impl Frame {
     /// Octets du buffer RGBA : ce que le cache LRU compte.
     pub fn bytes(&self) -> usize {
         self.rgba.len()
+    }
+
+    /// Reduit le buffer pour qu'il tienne dans `bw` x `bh` (jamais agrandi) ; `full_w` x `full_h` ne changent pas.
+    pub fn shrink_to(self, bw: u32, bh: u32) -> Result<Frame> {
+        let (nw, nh) = out_dims(self.w, self.h, Target::Fit(bw, bh), usize::MAX);
+        if (nw, nh) == (self.w, self.h) {
+            return Ok(self);
+        }
+        let rgba = resize::resize_rgba(self.rgba, self.w, self.h, nw, nh, true)?;
+        Ok(Frame { rgba, w: nw, h: nh, full_w: self.full_w, full_h: self.full_h })
     }
 }
 
@@ -78,6 +96,7 @@ pub fn decode_capped(path: &Path, target: Target, max_full_bytes: usize) -> Resu
 fn out_dims(fw: u32, fh: u32, target: Target, max_full_bytes: usize) -> (u32, u32) {
     let (bw, bh) = match target {
         Target::Preview => (PREVIEW_SIZE, PREVIEW_SIZE),
+        Target::Strip => (STRIP_W, STRIP_H),
         Target::Fit(w, h) => (w, h),
         Target::Full => {
             let bytes = fw as f64 * fh as f64 * 4.0;
@@ -163,6 +182,26 @@ mod tests {
         assert_eq!(out_dims(333, 217, Target::Preview, big), (256, 167));
         assert_eq!(out_dims(640, 480, Target::Full, big), (640, 480));
         assert_eq!(out_dims(10_000, 1, Target::Fit(100, 100), big), (100, 1));
+    }
+
+    #[test]
+    fn strip_fits_96_px_high_and_a_frame_shrinks_to_it() {
+        let big = usize::MAX;
+        assert_eq!(out_dims(640, 480, Target::Strip, big), (128, 96));
+        assert_eq!(out_dims(480, 640, Target::Strip, big), (72, 96));
+        assert_eq!(out_dims(3000, 1000, Target::Strip, big), (192, 64), "un panorama est plafonne en largeur");
+        assert_eq!(out_dims(100, 50, Target::Strip, big), (100, 50), "jamais agrandie");
+
+        // la miniature freedesktop (256 x 192) donne la miniature de filmstrip sans passer par le decode
+        let preview = decode(&fx("a.jpg"), Target::Preview).unwrap();
+        let strip = preview.clone().shrink_to(STRIP_W, STRIP_H).unwrap();
+        assert_eq!((strip.w, strip.h, strip.full_w, strip.full_h), (128, 96, 640, 480));
+        assert_eq!(strip.rgba.len(), 128 * 96 * 4);
+        assert!(is_red(px(&strip, 2, 2)));
+        let same = strip.clone().shrink_to(STRIP_W, STRIP_H).unwrap();
+        assert_eq!(same.rgba, strip.rgba, "deja assez petite : rendue telle quelle");
+        let direct = decode(&fx("a.jpg"), Target::Strip).unwrap();
+        assert_eq!((direct.w, direct.h), (128, 96));
     }
 
     #[test]

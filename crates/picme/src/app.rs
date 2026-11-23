@@ -15,7 +15,7 @@
 
 use crate::fileops::FileOpsHandle;
 use picme_core::cache::LruBytes;
-use picme_core::decode::{self, Frame, PREVIEW_SIZE, Target};
+use picme_core::decode::{self, Frame, PREVIEW_SIZE, STRIP_H, STRIP_W, Target};
 use picme_core::dir::{self, Entry};
 use picme_core::error::{Error, Result};
 use picme_core::media::{self, MediaKind};
@@ -47,7 +47,8 @@ pub enum Level {
 impl Level {
     fn of(target: Target) -> Level {
         match target {
-            Target::Preview => Level::Preview,
+            // jamais demande par le controller (cle du filmstrip, routee avant lui) ; `on_result` l'ecarte
+            Target::Preview | Target::Strip => Level::Preview,
             Target::Fit(..) => Level::Fit,
             Target::Full => Level::Full,
         }
@@ -113,6 +114,17 @@ impl Jobs for Pool<Key> {
     }
 }
 
+/// Le pool `thumbs` est partage avec le filmstrip : chacun n'y retire que ses propres cles.
+impl Jobs for std::rc::Rc<Pool<Key>> {
+    fn submit(&self, key: Key, priority: u32) {
+        Pool::submit(self, key, priority);
+    }
+
+    fn retain(&self, keep: &mut dyn FnMut(&Key) -> bool) {
+        Pool::retain(self, keep);
+    }
+}
+
 /// Seuls les types qui ont un decodeur ont un `Fit` et un `Full` ; les autres n'ont que la miniature freedesktop.
 fn decodable(kind: MediaKind) -> bool {
     !matches!(kind, MediaKind::Video | MediaKind::Raw)
@@ -158,6 +170,8 @@ pub struct Controller<T> {
     /// Taille de la vue en device pixels, inconnue tant que la fenetre n'est pas allouee.
     viewport: Option<(u32, u32)>,
     full_on: bool,
+    /// Change a chaque modification du contenu de la liste : la vue (filmstrip) ne se resynchronise que dessus.
+    rev: u64,
     budget: usize,
     cache: LruBytes<(Ident, Level), Image<T>>,
     full: Option<(Ident, Image<T>)>,
@@ -186,6 +200,7 @@ impl<T: Clone> Controller<T> {
             now: Box::new(Instant::now),
             viewport: None,
             full_on: false,
+            rev: 0,
             budget,
             cache: LruBytes::new(budget),
             full: None,
@@ -204,6 +219,11 @@ impl<T: Clone> Controller<T> {
 
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
+    }
+
+    /// Numero de version du contenu de la liste (insertion, retrait, fichier modifie, nouveau scan).
+    pub fn rev(&self) -> u64 {
+        self.rev
     }
 
     pub fn index(&self) -> Option<usize> {
@@ -235,6 +255,7 @@ impl<T: Clone> Controller<T> {
             } else {
                 dir::insert_sorted(&mut self.entries, entry);
             }
+            self.rev += 1;
         }
         self.set_current(Some(path));
         self.repeating = false;
@@ -248,6 +269,7 @@ impl<T: Clone> Controller<T> {
             return Show::Keep;
         }
         self.entries = entries;
+        self.rev += 1;
         if let Some(cur) = self.current.clone()
             && !self.entries.iter().any(|e| e.path == cur)
         {
@@ -300,12 +322,18 @@ impl<T: Clone> Controller<T> {
         self.refresh()
     }
 
-    /// Zoom au-dela du fit : demande le `Full` du courant (et le garde tant qu'on reste sur l'image).
+    /// Zoom au-dela du fit : demande le `Full` du courant (et le garde tant qu'on reste sur l'image). Retour au fit :
+    /// le `Full` est libere et la texture `Fit`, a la taille exacte de la vue, remplace le `Full` que le GPU
+    /// reduirait (crenele) ; sans `Fit` en cache, le `Full` reste a l'ecran en attendant.
     pub fn set_full(&mut self, on: bool) -> Show<T> {
         if self.full_on == on {
             return Show::Keep;
         }
         self.full_on = on;
+        if !on {
+            self.release_full();
+            self.shown = None;
+        }
         self.refresh()
     }
 
@@ -319,6 +347,7 @@ impl<T: Clone> Controller<T> {
         if !r.changed {
             return Show::Keep;
         }
+        self.rev += 1;
         for old in r.updated.iter().chain(r.removed.iter().map(|(_, e)| e)) {
             self.forget(&Ident::of(old));
         }
@@ -339,6 +368,9 @@ impl<T: Clone> Controller<T> {
 
     /// Resultat d'un pool.
     pub fn on_result(&mut self, key: Key, result: Result<Frame>) -> Show<T> {
+        if key.target == Target::Strip {
+            return Show::Keep;
+        }
         let id = Ident::of_key(&key);
         let level = Level::of(key.target);
         if !self.wanted.contains(&(id.clone(), level)) {
@@ -549,20 +581,24 @@ pub fn decode_work(budget: usize) -> impl Fn(&Key) -> Result<Frame> + Send + Syn
 
 /// Travail du pool `thumbs` : miniature freedesktop si elle est a jour, sinon decode `Preview`. Un `Preview` decode
 /// qui a la taille d'une miniature `large` (256 px de grand cote, ou l'image entiere si elle est plus petite) part
-/// au thread d'ecriture ; la thumbnail embarquee d'un HEIF, plus petite, n'est jamais ecrite.
+/// au thread d'ecriture ; la thumbnail embarquee d'un HEIF, plus petite, n'est jamais ecrite. Une cle `Strip`
+/// (filmstrip) suit le meme chemin puis reduit le resultat a `STRIP_W` x `STRIP_H`.
 pub fn thumb_work(store: Option<ThumbStore>, writer: FileOpsHandle) -> impl Fn(&Key) -> Result<Frame> + Send + Sync + 'static {
     move |key: &Key| {
         let kind = media::kind_from_path(&key.path).ok_or_else(|| Error::Unsupported(key.path.display().to_string()))?;
         let entry = Entry { path: key.path.clone(), kind, live_mov: None, mtime_ns: key.mtime_ns, size: key.size };
-        if let Some(frame) = store.as_ref().and_then(|s| s.read(&entry)) {
-            return Ok(frame);
-        }
-        let frame = decode::decode(&key.path, Target::Preview)?;
-        let large = frame.w.max(frame.h) == PREVIEW_SIZE || (frame.w, frame.h) == (frame.full_w, frame.full_h);
-        if store.is_some() && large {
-            writer.store_thumb(entry, frame.clone());
-        }
-        Ok(frame)
+        let frame = match store.as_ref().and_then(|s| s.read(&entry)) {
+            Some(frame) => frame,
+            None => {
+                let frame = decode::decode(&key.path, Target::Preview)?;
+                let large = frame.w.max(frame.h) == PREVIEW_SIZE || (frame.w, frame.h) == (frame.full_w, frame.full_h);
+                if store.is_some() && large {
+                    writer.store_thumb(entry, frame.clone());
+                }
+                frame
+            }
+        };
+        if key.target == Target::Strip { frame.shrink_to(STRIP_W, STRIP_H) } else { Ok(frame) }
     }
 }
 
@@ -892,6 +928,50 @@ mod tests {
     }
 
     #[test]
+    fn leaving_the_zoom_shows_the_fit_again_and_frees_the_full() {
+        let budget = 100 << 20;
+        let mut r = rig("ctl-unzoom", 5, 2, budget);
+        r.c.set_viewport(800, 600);
+        let fit = r.decode.take("i02.jpg", Level::Fit);
+        shown(r.c.on_result(fit, Ok(frame(800, 600))));
+        r.c.set_full(true);
+        let full = r.decode.take("i02.jpg", Level::Full);
+        assert_eq!(shown(r.c.on_result(full, Ok(frame(4000, 3000)))), (Level::Full, 4000, 3000));
+        // retour au fit : la texture Fit a la taille de la vue remplace le Full, qui est libere
+        assert_eq!(shown(r.c.set_full(false)), (Level::Fit, 800, 600));
+        assert!(r.c.full.is_none());
+        assert_eq!(r.c.cache.budget(), budget);
+        assert!(matches!(r.c.set_full(false), Show::Keep), "deja au fit");
+        // un nouveau zoom redemande le Full
+        r.c.set_full(true);
+        assert!(r.decode.jobs().iter().any(|j| j.0 == "i02.jpg" && j.1 == Target::Full));
+    }
+
+    #[test]
+    fn the_list_revision_moves_only_with_the_content_and_strip_results_are_not_the_controllers() {
+        let mut r = rig("ctl-rev", 4, 1, 256 << 20);
+        r.c.set_viewport(800, 600);
+        let rev = r.c.rev();
+        r.c.go(1);
+        r.c.set_viewport(900, 700);
+        assert_eq!(r.c.rev(), rev, "navigation et resize ne touchent pas la liste");
+        let p = r.dir.path().join("i01a.jpg");
+        std::fs::write(&p, b"x").unwrap();
+        r.c.reconcile(&p);
+        assert_eq!(r.c.rev(), rev + 1);
+        r.c.reconcile(&p);
+        assert_eq!(r.c.rev(), rev + 1, "idempotent : rien de change");
+        std::fs::remove_file(&p).unwrap();
+        r.c.reconcile(&p);
+        assert_eq!(r.c.rev(), rev + 2);
+
+        // un resultat du filmstrip qui arriverait ici ne devient ni Preview ni cache
+        let strip = Key { target: Target::Strip, ..r.thumbs.take("i02.jpg", Level::Preview) };
+        assert!(matches!(r.c.on_result(strip, Ok(frame(128, 96))), Show::Keep));
+        assert_eq!(r.c.cache.used_bytes(), 0);
+    }
+
+    #[test]
     fn current_fit_is_pinned_and_the_cache_stays_within_budget() {
         // budget de deux Fit : le courant reste, les voisins tournent
         let one = 800 * 600 * 4;
@@ -1059,5 +1139,25 @@ mod tests {
         let ops = FileOps::new(Some(store.clone()));
         let again = thumb_work(Some(store), ops.handle())(&key("a.jpg")).unwrap();
         assert_eq!(again.rgba, t.rgba);
+    }
+
+    #[test]
+    fn thumb_work_reduces_a_strip_key_to_the_strip_box_and_still_feeds_the_cache() {
+        let dir = TmpDir::new("ctl-strip");
+        let root = dir.path().join("thumbnails");
+        std::fs::copy(picme_core::fixtures_dir().join("a.jpg"), dir.path().join("a.jpg")).unwrap();
+        let store = ThumbStore::new(&root);
+        let ops = FileOps::new(Some(store.clone()));
+        let work = thumb_work(Some(store.clone()), ops.handle());
+        let entry = dir::stat_entry(&dir.path().join("a.jpg")).unwrap();
+
+        let strip = work(&Key::of(&entry, Target::Strip)).unwrap();
+        assert_eq!((strip.w, strip.h, strip.full_w, strip.full_h), (128, 96, 640, 480));
+        ops.finish();
+        // la miniature large a ete ecrite au passage, et la seconde demande la relit
+        assert!(store.read(&entry).is_some());
+        let ops = FileOps::new(Some(store.clone()));
+        let again = thumb_work(Some(store), ops.handle())(&Key::of(&entry, Target::Strip)).unwrap();
+        assert_eq!(again.rgba, strip.rgba);
     }
 }
