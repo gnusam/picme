@@ -1,0 +1,12 @@
+[package]
+name = "picme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+picme-core = { path = "../picme-core" }
+gtk4.workspace = true
+# alignes sur gst-plugin-gtk4 : utilises a partir du bloc 6 (video), declares ici pour verifier l'absence de doublon
+gstreamer.workspace = true
+gst-plugin-gtk4.workspace = true

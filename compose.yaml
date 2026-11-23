@@ -1,0 +1,45 @@
+# Deux services sur la meme image, conteneurs de travail crees une fois (docker compose up -d), puis docker compose exec -T.
+#   docker compose exec -T fetch cargo fetch
+#   docker compose exec -T dev cargo build --release --offline
+x-picme: &picme
+  image: picme-dev
+  build:
+    context: docker
+    network: host
+  command: sleep infinity
+  user: "1000:1000"
+  working_dir: /work
+  volumes:
+    - .:/work
+    - cargo:/cargo
+
+services:
+  dev:
+    <<: *picme
+    network_mode: none
+    ipc: host
+    # le cookie Xauthority est lie au hostname : meme nom que le poste, a surcharger via PICME_HOST (laptop-sam, ...)
+    hostname: ${PICME_HOST:-fixe-sam}
+    volumes:
+      - .:/work
+      - cargo:/cargo
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${HOME}/.Xauthority:/tmp/.Xauthority:ro
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      XAUTHORITY: /tmp/.Xauthority
+      HOME: /tmp/home
+      GSK_RENDERER: cairo
+      # sans /dev/dri ni dbus dans le conteneur : l'init EGL de GDK reste bloquee, le bus d'accessibilite est absent
+      GDK_DISABLE: gl,vulkan
+      GTK_A11Y: none
+      XDG_CACHE_HOME: /tmp/cache
+  # sert uniquement a cargo fetch (seul service avec le reseau)
+  fetch:
+    <<: *picme
+    network_mode: host
+    environment:
+      HOME: /tmp/home
+
+volumes:
+  cargo:
