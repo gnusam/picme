@@ -9,7 +9,9 @@
 //!   affiche que s'il appartient au courant et vaut mieux que ce qui est deja affiche de lui ;
 //! - le cache garde des `Preview` et des `Fit` par identite de fichier (chemin, mtime, taille), pas par taille de
 //!   fenetre : un resize reutilise ce qui est la, et ne redemande un `Fit` que s'il est plus petit que la fenetre ;
-//! - un seul slot `Full`, hors cache (le budget du cache est reduit d'autant), libere des qu'on quitte l'image.
+//! - un seul slot `Full`, hors cache (le budget du cache est reduit d'autant), libere des qu'on quitte l'image ;
+//! - en repetition (touche maintenue : navigations a moins de `REPEAT_GAP` l'une de l'autre), seulement des
+//!   `Preview`, du courant a +`REPEAT_AHEAD` ; les `Fit` attendent `settle`, `REPEAT_GAP` apres la derniere.
 
 use crate::fileops::FileOpsHandle;
 use picme_core::cache::LruBytes;
@@ -21,6 +23,7 @@ use picme_core::pool::{Key, Pool};
 use picme_core::thumbs::ThumbStore;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Priorites (la plus petite passe en premier). `Preview` et `Full` ne sont pas dans le meme pool.
 pub const PRIO_PREVIEW: u32 = 0;
@@ -28,6 +31,10 @@ pub const PRIO_FULL: u32 = 0;
 pub const PRIO_FIT: u32 = 1;
 /// Voisins : +1 puis -1 puis +2, dans le sens du deplacement.
 const NEIGHBOURS: [(u32, isize); 3] = [(2, 1), (3, -1), (4, 2)];
+/// Deux navigations plus proches que ca : repetition. Aussi le delai de `settle` apres la derniere.
+pub const REPEAT_GAP: Duration = Duration::from_millis(150);
+/// En repetition, `Preview` demandes du courant a +`REPEAT_AHEAD` dans le sens du deplacement.
+pub const REPEAT_AHEAD: usize = 4;
 
 /// Niveau d'une texture, du plus pauvre au plus riche.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -144,6 +151,10 @@ pub struct Controller<T> {
     current: Option<PathBuf>,
     /// Sens du dernier deplacement (+1 ou -1) : les voisins se prechargent dans ce sens d'abord.
     step: isize,
+    last_go: Option<Instant>,
+    repeating: bool,
+    /// Horloge (remplacee dans les tests).
+    now: Box<dyn Fn() -> Instant>,
     /// Taille de la vue en device pixels, inconnue tant que la fenetre n'est pas allouee.
     viewport: Option<(u32, u32)>,
     full_on: bool,
@@ -170,6 +181,9 @@ impl<T: Clone> Controller<T> {
             dir: None,
             current: None,
             step: 1,
+            last_go: None,
+            repeating: false,
+            now: Box::new(Instant::now),
             viewport: None,
             full_on: false,
             budget,
@@ -201,6 +215,11 @@ impl<T: Clone> Controller<T> {
         self.index().map(|i| &self.entries[i])
     }
 
+    /// Vrai pendant une repetition : l'appelant doit appeler `settle` `REPEAT_GAP` apres la derniere navigation.
+    pub fn repeating(&self) -> bool {
+        self.repeating
+    }
+
     /// Ouvre `path`. Hors du dossier courant, la liste devient ce seul fichier en attendant le scan du nouveau
     /// dossier (`set_entries`), que l'appelant lance s'il voit `dir()` changer.
     pub fn open(&mut self, path: &Path) -> Show<T> {
@@ -218,6 +237,7 @@ impl<T: Clone> Controller<T> {
             }
         }
         self.set_current(Some(path));
+        self.repeating = false;
         self.refresh()
     }
 
@@ -254,7 +274,20 @@ impl<T: Clone> Controller<T> {
         if j == i {
             return Show::Keep;
         }
+        let now = (self.now)();
+        self.repeating = self.last_go.is_some_and(|t| now.saturating_duration_since(t) < REPEAT_GAP);
+        self.last_go = Some(now);
         self.set_current(Some(self.entries[j].path.clone()));
+        self.refresh()
+    }
+
+    /// Fin de repetition, a appeler `REPEAT_GAP` apres la derniere navigation : les `Fit` sont demandes.
+    pub fn settle(&mut self) -> Show<T> {
+        let quiet = self.last_go.is_none_or(|t| (self.now)().saturating_duration_since(t) >= REPEAT_GAP);
+        if !self.repeating || !quiet {
+            return Show::Keep;
+        }
+        self.repeating = false;
         self.refresh()
     }
 
@@ -404,27 +437,10 @@ impl<T: Clone> Controller<T> {
 
         let has_full = self.full.as_ref().is_some_and(|(f, _)| *f == id);
         let has_fit = self.cache.contains(&(id.clone(), Level::Fit));
-        if decodable(cur.kind) {
-            if self.full_on && !has_full {
-                self.want(&cur, Target::Full, PRIO_FULL, true, &mut jobs);
-            }
-            if let Some(vp) = self.viewport
-                && !self.fit_enough(&id, vp)
-            {
-                self.want(&cur, Target::Fit(vp.0, vp.1), PRIO_FIT, true, &mut jobs);
-            }
-        }
-        if !has_full && !has_fit && !self.cache.contains(&(id.clone(), Level::Preview)) {
-            self.want(&cur, Target::Preview, PRIO_PREVIEW, false, &mut jobs);
-        }
-        if let Some(vp) = self.viewport {
-            for (prio, off) in NEIGHBOURS {
-                let Some(n) = i.checked_add_signed(off * self.step).and_then(|j| self.entries.get(j)) else { continue };
-                if decodable(n.kind) && !self.fit_enough(&Ident::of(n), vp) {
-                    let n = n.clone();
-                    self.want(&n, Target::Fit(vp.0, vp.1), prio, true, &mut jobs);
-                }
-            }
+        if self.repeating {
+            self.want_repeat(i, has_full, &mut jobs);
+        } else {
+            self.want_settled(i, has_full, has_fit, &mut jobs);
         }
 
         let keys: HashSet<&Key> = jobs.iter().map(|(k, _, _)| k).collect();
@@ -461,6 +477,51 @@ impl<T: Clone> Controller<T> {
                     }
                     _ => Show::Keep,
                 }
+            }
+        }
+    }
+
+    /// Repos : `Full` si demande, `Fit` du courant s'il manque, `Preview` si rien n'est en cache, `Fit` des voisins.
+    fn want_settled(&mut self, i: usize, has_full: bool, has_fit: bool, jobs: &mut Vec<(Key, u32, bool)>) {
+        let cur = self.entries[i].clone();
+        let id = Ident::of(&cur);
+        if decodable(cur.kind) {
+            if self.full_on && !has_full {
+                self.want(&cur, Target::Full, PRIO_FULL, true, jobs);
+            }
+            if let Some(vp) = self.viewport
+                && !self.fit_enough(&id, vp)
+            {
+                self.want(&cur, Target::Fit(vp.0, vp.1), PRIO_FIT, true, jobs);
+            }
+        }
+        if !has_full && !has_fit && !self.cache.contains(&(id.clone(), Level::Preview)) {
+            self.want(&cur, Target::Preview, PRIO_PREVIEW, false, jobs);
+        }
+        if let Some(vp) = self.viewport {
+            for (prio, off) in NEIGHBOURS {
+                let Some(n) = i.checked_add_signed(off * self.step).and_then(|j| self.entries.get(j)) else { continue };
+                if decodable(n.kind) && !self.fit_enough(&Ident::of(n), vp) {
+                    let n = n.clone();
+                    self.want(&n, Target::Fit(vp.0, vp.1), prio, true, jobs);
+                }
+            }
+        }
+    }
+
+
+    /// Repetition : `Preview` du courant a +`REPEAT_AHEAD`, le plus loin d'abord. Quand le decode est plus lent que
+    /// la repetition, un `Preview` lance pour +1 arriverait apres qu'on l'a depasse, alors que +4 arrive a temps ;
+    /// quand il est rapide (miniature sur disque), l'ordre ne change rien. Aucun `Fit` n'est soumis, mais ceux deja
+    /// lances restent acceptes.
+    fn want_repeat(&mut self, i: usize, has_full: bool, jobs: &mut Vec<(Key, u32, bool)>) {
+        for k in 0..=REPEAT_AHEAD {
+            let Some(n) = i.checked_add_signed(k as isize * self.step).and_then(|j| self.entries.get(j)).cloned() else { break };
+            let id = Ident::of(&n);
+            self.wanted.insert((id.clone(), Level::Fit));
+            let cached = (k == 0 && has_full) || [Level::Fit, Level::Preview].iter().any(|&l| self.cache.contains(&(id.clone(), l)));
+            if !cached {
+                self.want(&n, Target::Preview, (REPEAT_AHEAD - k) as u32, false, jobs);
             }
         }
     }
@@ -510,7 +571,7 @@ mod tests {
     use super::*;
     use crate::fileops::FileOps;
     use crate::testutil::TmpDir;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     /// File de jobs factice : ce qui a ete soumis et pas retire, avec sa priorite.
@@ -557,6 +618,19 @@ mod tests {
         decode: Rc<Fake>,
         thumbs: Rc<Fake>,
         dir: TmpDir,
+        clock: Rc<Clock>,
+    }
+
+    /// Horloge de test : avance de `step` a chaque lecture (1 s par defaut : jamais de repetition), plus `advance`.
+    struct Clock {
+        t: Cell<Instant>,
+        step: Cell<Duration>,
+    }
+
+    impl Clock {
+        fn advance(&self, ms: u64) {
+            self.t.set(self.t.get() + Duration::from_millis(ms));
+        }
     }
 
     const FULL: (u32, u32) = (4000, 3000);
@@ -578,10 +652,19 @@ mod tests {
             Box::new(FakeJobs(thumbs.clone())),
             Box::new(|f: Frame| (f.w, f.h)),
         );
+        let clock = Rc::new(Clock { t: Cell::new(Instant::now()), step: Cell::new(Duration::from_secs(1)) });
+        c.now = Box::new({
+            let clock = clock.clone();
+            move || {
+                let t = clock.t.get();
+                clock.t.set(t + clock.step.get());
+                t
+            }
+        });
         c.open(&dir.path().join(format!("i{cur:02}.jpg")));
         let list = dir::list(dir.path()).unwrap();
         c.set_entries(dir.path(), list);
-        Rig { c, decode, thumbs, dir }
+        Rig { c, decode, thumbs, dir, clock }
     }
 
     fn name(c: &Controller<Tex>) -> String {
@@ -621,6 +704,62 @@ mod tests {
         assert_eq!(r.decode.jobs(), [fit("i00.jpg", 1), fit("i01.jpg", 3)]);
         assert!(matches!(r.c.go(-1), Show::Keep));
         assert_eq!(name(&r.c), "i00.jpg");
+    }
+
+    fn preview(name: &str, p: u32) -> (String, Target, u32) {
+        (name.to_string(), Target::Preview, p)
+    }
+
+    #[test]
+    fn held_key_asks_previews_ahead_and_fits_only_once_settled() {
+        let mut r = rig("ctl-repeat", 12, 2, 256 << 20);
+        r.c.set_viewport(800, 600);
+        r.clock.step.set(Duration::ZERO);
+
+        // premiere navigation apres un temps calme : pas de repetition, Fit du courant et des voisins
+        r.clock.advance(1000);
+        r.c.go(1);
+        assert!(!r.c.repeating());
+        assert_eq!(r.decode.jobs(), [fit("i03.jpg", 1), fit("i04.jpg", 2), fit("i02.jpg", 3), fit("i05.jpg", 4)]);
+        let fit4 = r.decode.take("i04.jpg", Level::Fit); // deja chez un worker
+
+        // 40 ms plus tard : repetition, Preview du courant a +4 (le plus loin d'abord), aucun Fit en file
+        r.clock.advance(40);
+        r.c.go(1);
+        assert!(r.c.repeating());
+        assert_eq!(name(&r.c), "i04.jpg");
+        assert!(r.decode.jobs().is_empty(), "{:?}", r.decode.jobs());
+        assert_eq!(r.thumbs.jobs(), [preview("i08.jpg", 0), preview("i07.jpg", 1), preview("i06.jpg", 2), preview("i05.jpg", 3), preview("i04.jpg", 4)]);
+
+        // un Fit lance avant la repetition reste accepte ; un Preview d'avance entre en cache sans etre affiche
+        assert_eq!(shown(r.c.on_result(fit4, Ok(frame(800, 600)))), (Level::Fit, 800, 600));
+        let p5 = r.thumbs.take("i05.jpg", Level::Preview);
+        assert!(matches!(r.c.on_result(p5, Ok(frame(256, 192))), Show::Keep));
+
+        // settle trop tot : rien ne change
+        r.clock.advance(40);
+        assert!(matches!(r.c.settle(), Show::Keep));
+        assert!(r.c.repeating());
+        assert!(r.decode.jobs().is_empty());
+
+        // on arrive sur i05 : son Preview s'affiche aussitot, l'avance suit (i05 en cache n'est plus demande)
+        r.clock.advance(40);
+        assert_eq!(shown(r.c.go(1)), (Level::Preview, 256, 192));
+        assert!(r.c.repeating());
+        assert!(r.decode.jobs().is_empty());
+        assert_eq!(r.thumbs.jobs(), [preview("i09.jpg", 0), preview("i08.jpg", 1), preview("i07.jpg", 2), preview("i06.jpg", 3)]);
+        let p7 = r.thumbs.take("i07.jpg", Level::Preview);
+
+        // 150 ms sans navigation : repos, Fit du courant et des voisins (i04 a deja le sien), Preview d'avance retires
+        r.clock.advance(150);
+        assert!(matches!(r.c.settle(), Show::Keep));
+        assert!(!r.c.repeating());
+        assert_eq!(r.decode.jobs(), [fit("i05.jpg", 1), fit("i06.jpg", 2), fit("i07.jpg", 4)]);
+        assert!(r.thumbs.jobs().is_empty(), "{:?}", r.thumbs.jobs());
+        assert!(matches!(r.c.on_result(p7.clone(), Ok(frame(256, 192))), Show::Keep));
+        assert!(!r.c.cache.contains(&(Ident::of_key(&p7), Level::Preview)), "Preview d'avance arrive apres le repos : jete");
+        assert!(matches!(r.c.settle(), Show::Keep), "deja au repos");
+        assert_eq!(r.decode.jobs().len(), 3);
     }
 
     #[test]
