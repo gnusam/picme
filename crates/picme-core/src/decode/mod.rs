@@ -7,6 +7,8 @@
 mod heif;
 mod jpeg;
 mod jxl;
+#[cfg(feature = "raw")]
+mod raw;
 mod raster;
 mod resize;
 
@@ -107,6 +109,9 @@ pub fn decode_capped(path: &Path, target: Target, max_full_bytes: usize) -> Resu
         Some(kind @ (MediaKind::Png | MediaKind::Webp | MediaKind::Tiff)) => raster::decode(path, kind, target, max_full_bytes),
         Some(MediaKind::Heif) => heif::decode(path, target, max_full_bytes),
         Some(MediaKind::Jxl) => jxl::decode(path, target, max_full_bytes),
+        #[cfg(feature = "raw")]
+        Some(MediaKind::Raw) => raw::decode(path, target, max_full_bytes),
+        #[cfg(not(feature = "raw"))]
         Some(MediaKind::Raw) => Err(Error::Unsupported("RAW".into())),
         Some(MediaKind::Video) => Err(Error::Unsupported("video".into())),
         None => Err(Error::Unsupported(format!("type inconnu : {}", path.display()))),

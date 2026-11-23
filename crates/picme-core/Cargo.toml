@@ -19,6 +19,11 @@ libheif-rs = { version = "3.0", default-features = false, features = ["v1_17"] }
 md-5 = "0.11"
 percent-encoding = "2.3"
 png = "0.18"
+rawler = { version = "0.8", optional = true }
 # libjpeg-turbo systeme par pkg-config (pas de cmake ni de build embarque). 0.5 et pas 1.x : la 1.x exige TurboJPEG 3
 # (libturbojpeg >= 3.0), Debian 13 n'a que la 2.1.5. Pas d'API de scaling : on passe une Image plus petite a tjDecompress2.
 turbojpeg = { version = "0.5", default-features = false, features = ["pkg-config", "require-simd"] }
+
+[features]
+# RAW : l'image JPEG embarquee, lue par rawler (desactivee par defaut : dependance lourde)
+raw = ["dep:rawler"]
