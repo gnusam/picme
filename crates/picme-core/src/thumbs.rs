@@ -18,7 +18,6 @@
 use crate::decode::{self, Frame, ratio_matches};
 use crate::dir::Entry;
 use crate::error::{Error, Result};
-use crate::media::MediaKind;
 use md5::{Digest, Md5};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
 use std::fmt::Write as _;
@@ -242,15 +241,13 @@ impl ThumbStore {
 
     /// Ecrit la miniature de `entry` dans le dossier `size` (`normal` ou `large` seulement : les grandes tailles
     /// sont celles des file managers). `frame` doit tenir dans la boite de `size` ; `frame.full_w` x `frame.full_h`
-    /// deviennent `Thumb::Image::Width` et `Height`. Refuse les videos. Rend `false` sans rien ecrire si une
+    /// deviennent `Thumb::Image::Width` et `Height` (pour une video, la premiere image vient de GStreamer, voir
+    /// `picme::video`). Rend `false` sans rien ecrire si une
     /// miniature valide est deja la (jamais ecrasee : une perimee ou illisible l'est). Entre le controle et le
     /// `rename`, un autre programme peut en poser une : elle est remplacee par une equivalente.
     pub fn store(&self, entry: &Entry, frame: &Frame, size: ThumbSize) -> Result<bool> {
         if !size.writable() {
             return Err(Error::Invalid(format!("picme n'ecrit pas la taille {}", size.dir())));
-        }
-        if entry.kind == MediaKind::Video {
-            return Err(Error::Unsupported("miniature de video".into()));
         }
         let max = size.px();
         if frame.w == 0 || frame.h == 0 || frame.w > max || frame.h > max {
@@ -385,6 +382,7 @@ mod tests {
     use crate::decode::{Target, decode};
     use crate::dir::stat_entry;
     use crate::fixtures_dir;
+    use crate::media::MediaKind;
     use crate::testutil::TmpDir;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
@@ -548,14 +546,12 @@ mod tests {
     }
 
     #[test]
-    fn store_refuses_videos_foreign_sizes_and_oversized_frames() {
+    fn store_refuses_foreign_sizes_and_oversized_frames() {
         let tmp = TmpDir::new("thumbs-refuse");
         let entry = copy_fixture(tmp.path(), "a.jpg");
         let store = ThumbStore::new(tmp.path().join("t"));
         let frame = decode(&entry.path, Target::Fit(256, 256)).unwrap();
 
-        let video = Entry { kind: MediaKind::Video, ..entry.clone() };
-        assert!(matches!(store.store(&video, &frame, ThumbSize::Large), Err(Error::Unsupported(_))));
         let big = decode(&entry.path, Target::Fit(300, 300)).unwrap();
         assert!(matches!(store.store(&entry, &big, ThumbSize::Large), Err(Error::Invalid(_))));
         // 256 px ne tient pas dans `normal`
@@ -565,6 +561,19 @@ mod tests {
             assert!(matches!(store.store(&entry, &frame, size), Err(Error::Invalid(_))), "{size:?}");
         }
         assert!(!tmp.path().join("t").exists(), "rien n'est cree en cas de refus");
+    }
+
+    #[test]
+    fn a_video_gets_a_freedesktop_thumbnail_like_an_image() {
+        let tmp = TmpDir::new("thumbs-video");
+        let entry = copy_fixture(tmp.path(), "a.jpg");
+        let video = Entry { kind: MediaKind::Video, ..entry.clone() };
+        let store = ThumbStore::new(tmp.path().join("t"));
+        // la premiere image d'une video vient de GStreamer : ici une frame quelconque de la bonne forme
+        let frame = decode(&entry.path, Target::Fit(256, 256)).unwrap();
+        assert!(store.store(&video, &frame, ThumbSize::Large).unwrap());
+        let back = store.read(&video, 256).unwrap();
+        assert_eq!((back.w, back.h), (frame.w, frame.h));
     }
 
     #[test]

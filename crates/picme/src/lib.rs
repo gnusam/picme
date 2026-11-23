@@ -8,6 +8,7 @@ pub mod filmstrip;
 pub mod keys;
 pub mod monitor;
 pub mod osd;
+pub mod video;
 pub mod view;
 
 #[cfg(test)]

@@ -131,11 +131,7 @@ impl Jobs for std::rc::Rc<Pool<Key>> {
 /// Seuls les types qui ont un decodeur ont un `Fit` et un `Full` ; les autres n'ont que la miniature freedesktop.
 /// Le RAW en a un avec la feature `raw`.
 fn decodable(kind: MediaKind) -> bool {
-    match kind {
-        MediaKind::Video => false,
-        MediaKind::Raw => cfg!(feature = "raw"),
-        _ => true,
-    }
+    kind != MediaKind::Video && (kind != MediaKind::Raw || cfg!(feature = "raw"))
 }
 
 /// Dimensions d'une image `fw` x `fh` dans une boite `bw` x `bh`, jamais agrandie (meme calcul que le decode).
@@ -683,7 +679,11 @@ pub fn thumb_work(store: Option<ThumbStore>, writer: FileOpsHandle) -> impl Fn(&
         let frame = match store.as_ref().and_then(|s| s.read(&entry, want)) {
             Some(frame) => frame,
             None => {
-                let frame = decode::decode(&key.path, Target::Preview)?;
+                // une video n'a pas de decodeur : sa premiere image vient de GStreamer, reduite comme un Preview
+                let frame = match kind {
+                    MediaKind::Video => crate::video::first_frame(&key.path)?.shrink_to(PREVIEW_SIZE, PREVIEW_SIZE)?,
+                    _ => decode::decode(&key.path, Target::Preview)?,
+                };
                 let large = frame.w.max(frame.h) == PREVIEW_SIZE || (frame.w, frame.h) == (frame.full_w, frame.full_h);
                 if let Some(store) = &store
                     && large
@@ -1368,6 +1368,27 @@ mod tests {
         let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let again = thumb_work(Some(store), ops.handle())(&Key::of(&entry, Target::Strip)).unwrap();
         assert_eq!(again.rgba, strip.rgba);
+    }
+
+    #[test]
+    fn thumb_work_takes_the_first_frame_of_a_video_and_caches_it_for_the_file_managers() {
+        let dir = TmpDir::new("ctl-video-thumb");
+        let root = dir.path().join("thumbnails");
+        std::fs::copy(picme_core::fixtures_dir().join("j.mov"), dir.path().join("j.mov")).unwrap();
+        let store = ThumbStore::new(&root);
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
+        let entry = dir::stat_entry(&dir.path().join("j.mov")).unwrap();
+        assert_eq!(entry.kind, MediaKind::Video);
+
+        let f = thumb_work(Some(store.clone()), ops.handle())(&Key::of(&entry, Target::Preview)).unwrap();
+        assert!(f.w.max(f.h) <= PREVIEW_SIZE && f.full_w >= f.w);
+        let strip = thumb_work(Some(store.clone()), ops.handle())(&Key::of(&entry, Target::Strip)).unwrap();
+        assert!(strip.w <= STRIP_W && strip.h <= STRIP_H);
+        ops.finish();
+        // normal et large sont ecrites : la seconde lecture ne relance pas GStreamer
+        let large = store.read(&entry, 256).expect("miniature large de la video");
+        assert_eq!((large.full_w, large.full_h), (f.full_w, f.full_h));
+        assert!(store.read(&entry, 128).is_some());
     }
 
     /// Miniature RGB grise de `w` x `h` posee comme le ferait un autre programme (MTime fractionnaire, ni Size ni Image).
