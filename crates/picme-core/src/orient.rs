@@ -132,7 +132,12 @@ impl Orientation {
     /// Applique l'orientation a un buffer RGBA8 stocke en `w` x `h`. Rend le buffer affiche et ses dimensions
     /// (le buffer d'origine est rendu tel quel pour `Normal`).
     pub fn apply_rgba(self, buf: Vec<u8>, w: u32, h: u32) -> (Vec<u8>, u32, u32) {
-        assert_eq!(buf.len(), w as usize * h as usize * 4, "buffer RGBA de taille incoherente");
+        self.apply_px::<4>(buf, w, h)
+    }
+
+    /// [`apply_rgba`](Self::apply_rgba) pour des pixels de `N` octets, sans lignes bourrees (PNG brut : 1 a 8 octets).
+    pub fn apply_px<const N: usize>(self, buf: Vec<u8>, w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+        assert_eq!(buf.len(), w as usize * h as usize * N, "buffer de taille incoherente");
         if self == Orientation::Normal {
             return (buf, w, h);
         }
@@ -148,11 +153,11 @@ impl Orientation {
         let step_y = (along_y.1 - origin.1) * sw + (along_y.0 - origin.0);
 
         let mut out = vec![0u8; buf.len()];
-        for (dy, row) in out.chunks_exact_mut(dw as usize * 4).enumerate() {
+        for (dy, row) in out.chunks_exact_mut(dw as usize * N).enumerate() {
             let mut idx = start + dy as i64 * step_y;
-            for px in row.as_chunks_mut::<4>().0 {
-                let s = idx as usize * 4;
-                px.copy_from_slice(&buf[s..s + 4]);
+            for px in row.as_chunks_mut::<N>().0 {
+                let s = idx as usize * N;
+                px.copy_from_slice(&buf[s..s + N]);
                 idx += step_x;
             }
         }

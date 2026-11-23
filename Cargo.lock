@@ -1341,6 +1341,7 @@ name = "picme-core"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "crc32fast",
  "fast_image_resize",
  "image",
  "jxl-oxide",

@@ -191,6 +191,15 @@ impl ThumbStore {
         thumb_path(&self.root, size.dir(), &uri(&entry.path))
     }
 
+    /// Retire les miniatures normal et large de `path` (celles que picme ecrit), apres une modification ou une
+    /// suppression : MTime est en secondes, une reecriture dans la meme seconde a la meme taille les laisserait
+    /// valides. Les autres tailles appartiennent a d'autres programmes : elles ne sont pas touchees, la validation
+    /// par MTime et Size les ecarte. Rend le nombre de fichiers retires.
+    pub fn forget(&self, path: &Path) -> usize {
+        let uri = uri(path);
+        ThumbSize::ALL.iter().filter(|s| s.writable()).filter(|s| std::fs::remove_file(thumb_path(&self.root, s.dir(), &uri)).is_ok()).count()
+    }
+
     /// La racine puis l'ancien dossier, dans l'ordre de consultation.
     fn roots(&self) -> impl Iterator<Item = &Path> {
         std::iter::once(self.root.as_path()).chain(self.legacy.as_deref())
@@ -521,6 +530,21 @@ mod tests {
         let other = Entry { path: entry.path.with_file_name("autre.jpg"), ..entry.clone() };
         std::fs::copy(root.join("normal").join(&name), root.join("normal").join(file_name(&uri(&other.path)))).unwrap();
         assert!(store.read(&other, 256).is_none());
+    }
+
+    #[test]
+    fn forget_removes_only_the_sizes_picme_writes() {
+        let tmp = TmpDir::new("thumbs-forget");
+        let entry = copy_fixture(tmp.path(), "a.jpg");
+        let store = ThumbStore::new(tmp.path().join("t"));
+        store.store_standard(&entry, decode(&entry.path, Target::Fit(256, 256)).unwrap()).unwrap();
+        let xl = store.path_of(&entry, ThumbSize::XLarge);
+        std::fs::create_dir_all(xl.parent().unwrap()).unwrap();
+        std::fs::copy(store.path_of(&entry, ThumbSize::Large), &xl).unwrap();
+        assert_eq!(store.forget(&entry.path), 2);
+        assert!(!store.path_of(&entry, ThumbSize::Normal).exists() && !store.path_of(&entry, ThumbSize::Large).exists());
+        assert!(xl.exists(), "x-large d'un autre programme : pas touche");
+        assert_eq!(store.forget(&entry.path), 0);
     }
 
     #[test]

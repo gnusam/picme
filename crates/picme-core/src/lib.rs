@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod decode;
 pub mod dir;
+pub mod edit;
 pub mod error;
 pub mod media;
 pub mod orient;
