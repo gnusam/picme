@@ -12,7 +12,7 @@ use picme::view::ZOOM_STEP;
 use picme_core::decode::{DEFAULT_BUDGET_BYTES, Frame, Target};
 use picme_core::dir::{self, Entry};
 use picme_core::pool::{self, Key, Pool};
-use picme_core::thumbs::{self, ThumbStore};
+use picme_core::thumbs::ThumbStore;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -311,7 +311,7 @@ fn main() {
     // pools et thread d'ecriture avant gtk::init : le Preview de argv[1] se decode pendant l'init GTK
     let (tx, rx) = async_channel::unbounded::<(Key, picme_core::Result<Frame>)>();
     let budget = DEFAULT_BUDGET_BYTES;
-    let store = thumbs::default_root().map(ThumbStore::new);
+    let store = ThumbStore::system();
     let fileops = FileOps::new(store.clone());
     let first_preview = AtomicBool::new(true);
     let thumb_work = app::thumb_work(store, fileops.handle());

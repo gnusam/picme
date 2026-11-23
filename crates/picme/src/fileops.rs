@@ -32,7 +32,7 @@ pub struct FileOpsHandle {
 }
 
 impl FileOpsHandle {
-    /// Ecrit la miniature `large` de `entry`. Faux si elle est jetee (file pleine, ou thread arrete).
+    /// Ecrit les miniatures `large` et `normal` de `entry`. Faux si elles sont jetees (file pleine, ou thread arrete).
     pub fn store_thumb(&self, entry: Entry, frame: Frame) -> bool {
         if self.thumbs_pending.fetch_add(1, Ordering::AcqRel) >= MAX_THUMB_BACKLOG {
             self.thumbs_pending.fetch_sub(1, Ordering::AcqRel);
@@ -64,7 +64,7 @@ impl FileOps {
                     match op {
                         Op::StoreThumb { entry, frame } => {
                             if let Some(store) = &thumbs
-                                && let Err(e) = store.store(&entry, &frame)
+                                && let Err(e) = store.store_standard(&entry, frame)
                             {
                                 eprintln!("picme : miniature de {} : {e}", entry.path.display());
                             }
@@ -113,7 +113,7 @@ mod tests {
     }
 
     fn frame() -> Frame {
-        Frame { rgba: vec![128; 256 * 192 * 4], w: 256, h: 192, full_w: 640, full_h: 480 }
+        Frame { rgba: vec![128; 256 * 192 * 4], w: 256, h: 192, full_w: 640, full_h: 480, low_res: false }
     }
 
     #[test]
@@ -128,7 +128,8 @@ mod tests {
         }
         ops.finish();
         for e in &entries {
-            assert!(store.read(e).is_some(), "{}", e.path.display());
+            assert!(store.read(e, 256).is_some(), "{}", e.path.display());
+            assert!(store.read(e, 128).is_some_and(|f| f.w == 128), "normal : {}", e.path.display());
         }
         // thread arrete : la soumission echoue sans bloquer ni paniquer
         assert!(!handle.store_thumb(entries[0].clone(), frame()));

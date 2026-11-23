@@ -12,3 +12,7 @@ gtk4.workspace = true
 # alignes sur gst-plugin-gtk4 : utilises a partir du bloc 6 (video), declares ici pour verifier l'absence de doublon
 gstreamer.workspace = true
 gst-plugin-gtk4.workspace = true
+
+[dev-dependencies]
+# miniatures d'autres programmes fabriquees par les tests de `thumb_work`
+png = "0.18"

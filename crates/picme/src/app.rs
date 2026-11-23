@@ -20,7 +20,7 @@ use picme_core::dir::{self, Entry};
 use picme_core::error::{Error, Result};
 use picme_core::media::{self, MediaKind};
 use picme_core::pool::{Key, Pool};
-use picme_core::thumbs::ThumbStore;
+use picme_core::thumbs::{PREVIEW_WANT, ThumbStore};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -83,6 +83,9 @@ pub struct Image<T> {
     pub h: u32,
     pub full_w: u32,
     pub full_h: u32,
+    /// Miniature de cache plus petite que demande (`Frame::low_res`) : jamais agrandie, la vue l'etire ; vrai
+    /// seulement pour un `Preview`.
+    pub low_res: bool,
 }
 
 /// Ce que la vue doit faire apres un appel au controller.
@@ -399,8 +402,8 @@ impl<T: Clone> Controller<T> {
             return Show::Keep;
         }
         let bytes = frame.bytes();
-        let (w, h, full_w, full_h) = (frame.w, frame.h, frame.full_w, frame.full_h);
-        let img = Image { texture: (self.make)(frame), level, w, h, full_w, full_h };
+        let (w, h, full_w, full_h, low_res) = (frame.w, frame.h, frame.full_w, frame.full_h, frame.low_res);
+        let img = Image { texture: (self.make)(frame), level, w, h, full_w, full_h, low_res };
         match level {
             Level::Full => {
                 self.full = Some((id.clone(), img.clone()));
@@ -579,20 +582,27 @@ pub fn decode_work(budget: usize) -> impl Fn(&Key) -> Result<Frame> + Send + Syn
     move |key: &Key| decode::decode_capped(&key.path, key.target, budget / 2)
 }
 
-/// Travail du pool `thumbs` : miniature freedesktop si elle est a jour, sinon decode `Preview`. Un `Preview` decode
-/// qui a la taille d'une miniature `large` (256 px de grand cote, ou l'image entiere si elle est plus petite) part
-/// au thread d'ecriture ; la thumbnail embarquee d'un HEIF, plus petite, n'est jamais ecrite. Une cle `Strip`
-/// (filmstrip) suit le meme chemin puis reduit le resultat a `STRIP_W` x `STRIP_H`.
+/// Travail du pool `thumbs` : miniature freedesktop si elle est a jour, sinon decode `Preview`. Un `Preview` demande
+/// la plus grande miniature disponible (`PREVIEW_WANT`, jusqu'a la xx-large des file managers), une cle `Strip` la
+/// plus petite qui couvre `STRIP_W` x `STRIP_H` ; `Frame::low_res` dit quand elle est plus petite que demande. Un
+/// `Preview` decode qui a la taille d'une miniature `large` (256 px de grand cote, ou l'image entiere si elle est
+/// plus petite) part au thread d'ecriture (`large` et `normal`), sauf si un autre programme a marque le fichier en
+/// echec ; la thumbnail embarquee d'un HEIF, plus petite, n'est jamais ecrite. Une cle `Strip` (filmstrip) reduit
+/// le resultat a `STRIP_W` x `STRIP_H`.
 pub fn thumb_work(store: Option<ThumbStore>, writer: FileOpsHandle) -> impl Fn(&Key) -> Result<Frame> + Send + Sync + 'static {
     move |key: &Key| {
         let kind = media::kind_from_path(&key.path).ok_or_else(|| Error::Unsupported(key.path.display().to_string()))?;
         let entry = Entry { path: key.path.clone(), kind, live_mov: None, mtime_ns: key.mtime_ns, size: key.size };
-        let frame = match store.as_ref().and_then(|s| s.read(&entry)) {
+        let want = if key.target == Target::Strip { STRIP_W.max(STRIP_H) } else { PREVIEW_WANT };
+        let frame = match store.as_ref().and_then(|s| s.read(&entry, want)) {
             Some(frame) => frame,
             None => {
                 let frame = decode::decode(&key.path, Target::Preview)?;
                 let large = frame.w.max(frame.h) == PREVIEW_SIZE || (frame.w, frame.h) == (frame.full_w, frame.full_h);
-                if store.is_some() && large {
+                if let Some(store) = &store
+                    && large
+                    && !store.marked_failed(&entry)
+                {
                     writer.store_thumb(entry, frame.clone());
                 }
                 frame
@@ -607,6 +617,7 @@ mod tests {
     use super::*;
     use crate::fileops::FileOps;
     use crate::testutil::TmpDir;
+    use picme_core::thumbs::ThumbSize;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
@@ -672,7 +683,7 @@ mod tests {
     const FULL: (u32, u32) = (4000, 3000);
 
     fn frame(w: u32, h: u32) -> Frame {
-        Frame { rgba: vec![0; w as usize * h as usize * 4], w, h, full_w: FULL.0, full_h: FULL.1 }
+        Frame { rgba: vec![0; w as usize * h as usize * 4], w, h, full_w: FULL.0, full_h: FULL.1, low_res: false }
     }
 
     /// Dossier de `n` fichiers vides `i00.jpg`, `i01.jpg`... listes, et le courant sur `i{cur}`.
@@ -1132,9 +1143,11 @@ mod tests {
         ops.finish();
 
         let entry = |n: &str| dir::stat_entry(&dir.path().join(n)).unwrap();
-        let t = store.read(&entry("a.jpg")).expect("miniature large ecrite");
+        let t = store.read(&entry("a.jpg"), 256).expect("miniature large ecrite");
         assert_eq!((t.w, t.h, t.full_w, t.full_h), (256, 192, 640, 480));
-        assert!(store.read(&entry("k_thumb.heic")).is_none());
+        let n = store.read(&entry("a.jpg"), 128).expect("miniature normal ecrite");
+        assert_eq!((n.w, n.h), (128, 96));
+        assert!(store.read(&entry("k_thumb.heic"), 256).is_none());
         // seconde lecture : servie par la miniature (meme resultat)
         let ops = FileOps::new(Some(store.clone()));
         let again = thumb_work(Some(store), ops.handle())(&key("a.jpg")).unwrap();
@@ -1155,9 +1168,98 @@ mod tests {
         assert_eq!((strip.w, strip.h, strip.full_w, strip.full_h), (128, 96, 640, 480));
         ops.finish();
         // la miniature large a ete ecrite au passage, et la seconde demande la relit
-        assert!(store.read(&entry).is_some());
+        assert!(store.read(&entry, 256).is_some());
         let ops = FileOps::new(Some(store.clone()));
         let again = thumb_work(Some(store), ops.handle())(&Key::of(&entry, Target::Strip)).unwrap();
         assert_eq!(again.rgba, strip.rgba);
+    }
+
+    /// Miniature RGB grise de `w` x `h` posee comme le ferait un autre programme (MTime fractionnaire, ni Size ni Image).
+    fn put_foreign(path: &Path, entry: &Entry, (w, h): (u32, u32), shade: u8) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut enc = png::Encoder::new(std::fs::File::create(path).unwrap(), w, h);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.add_text_chunk("Thumb::URI".into(), picme_core::thumbs::uri(&entry.path)).unwrap();
+        enc.add_text_chunk("Thumb::MTime".into(), format!("{}.000000", entry.mtime_ns / 1_000_000_000)).unwrap();
+        let mut writer = enc.write_header().unwrap();
+        writer.write_image_data(&vec![shade; w as usize * h as usize * 3]).unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn thumb_work_serves_a_preview_from_a_big_foreign_thumbnail_without_decoding_or_writing() {
+        let dir = TmpDir::new("ctl-foreign");
+        let root = dir.path().join("thumbnails");
+        std::fs::copy(picme_core::fixtures_dir().join("a.jpg"), dir.path().join("a.jpg")).unwrap();
+        let entry = dir::stat_entry(&dir.path().join("a.jpg")).unwrap();
+        let store = ThumbStore::new(&root);
+        // a.jpg a 640x480 : sa xx-large est l'image entiere ; la teinte 77 ne vient pas d'un decode
+        put_foreign(&store.path_of(&entry, ThumbSize::XXLarge), &entry, (640, 480), 77);
+        let ops = FileOps::new(Some(store.clone()));
+        let work = thumb_work(Some(store.clone()), ops.handle());
+
+        let f = work(&Key::of(&entry, Target::Preview)).unwrap();
+        assert_eq!((f.w, f.h, f.full_w, f.full_h, f.low_res), (640, 480, 640, 480, false));
+        assert!(f.rgba.chunks(4).all(|p| p == [77, 77, 77, 255]));
+        // le filmstrip n'en prend que la reduction
+        let s = work(&Key::of(&entry, Target::Strip)).unwrap();
+        assert_eq!((s.w, s.h), (128, 96));
+        ops.finish();
+        // rien n'est ecrit quand une miniature suffisait
+        assert!(!store.path_of(&entry, ThumbSize::Large).exists() && !store.path_of(&entry, ThumbSize::Normal).exists());
+    }
+
+    #[test]
+    fn thumb_work_flags_a_low_res_cache_hit_and_decodes_when_the_cache_is_stale() {
+        let dir = TmpDir::new("ctl-lowres");
+        let root = dir.path().join("thumbnails");
+        std::fs::copy(picme_core::fixtures_dir().join("a.jpg"), dir.path().join("a.jpg")).unwrap();
+        let entry = dir::stat_entry(&dir.path().join("a.jpg")).unwrap();
+        let store = ThumbStore::new(&root);
+        put_foreign(&store.path_of(&entry, ThumbSize::Normal), &entry, (128, 96), 33);
+        let ops = FileOps::new(Some(store.clone()));
+        let work = thumb_work(Some(store.clone()), ops.handle());
+
+        let f = work(&Key::of(&entry, Target::Preview)).unwrap();
+        assert_eq!((f.w, f.low_res), (128, true));
+        assert!(f.rgba.chunks(4).all(|p| p == [33, 33, 33, 255]));
+
+        // la normal est perimee : decode, et le resultat n'est pas low_res
+        let newer = Entry { mtime_ns: entry.mtime_ns + 60_000_000_000, ..entry.clone() };
+        let g = work(&Key::of(&newer, Target::Preview)).unwrap();
+        assert_eq!((g.w, g.h, g.low_res), (256, 192, false));
+        ops.finish();
+    }
+
+    #[test]
+    fn thumb_work_does_not_write_thumbnails_for_a_file_another_program_failed_on() {
+        let dir = TmpDir::new("ctl-fail");
+        let root = dir.path().join("thumbnails");
+        std::fs::copy(picme_core::fixtures_dir().join("a.jpg"), dir.path().join("a.jpg")).unwrap();
+        let entry = dir::stat_entry(&dir.path().join("a.jpg")).unwrap();
+        let store = ThumbStore::new(&root);
+        let name = store.path_of(&entry, ThumbSize::Large).file_name().unwrap().to_owned();
+        put_foreign(&root.join("fail/gnome-thumbnail-factory").join(name), &entry, (1, 1), 0);
+        let ops = FileOps::new(Some(store.clone()));
+        let work = thumb_work(Some(store.clone()), ops.handle());
+
+        // l'affichage decode quand meme (c'est le travail de picme), mais ne genere pas de miniature
+        let f = work(&Key::of(&entry, Target::Preview)).unwrap();
+        assert_eq!((f.w, f.h), (256, 192));
+        ops.finish();
+        assert!(!store.path_of(&entry, ThumbSize::Large).exists() && !store.path_of(&entry, ThumbSize::Normal).exists());
+    }
+
+    #[test]
+    fn on_result_keeps_the_low_res_flag_of_a_preview() {
+        let mut r = rig("ctl-lowres-flag", 3, 1, 256 << 20);
+        r.c.set_viewport(800, 600);
+        let key = r.thumbs.take("i01.jpg", Level::Preview);
+        let low = Frame { low_res: true, ..frame(256, 192) };
+        match r.c.on_result(key, Ok(low)) {
+            Show::Image(img) => assert!(img.low_res && img.level == Level::Preview),
+            other => panic!("{other:?}"),
+        }
     }
 }
