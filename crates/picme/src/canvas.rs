@@ -4,6 +4,7 @@
 //! 256 px occupe deja la place exacte du `Fit` qui le remplacera, sans saut ; au fit, le rectangle est a l'entier
 //! de device pixel pres, la texture `Fit` est copiee sans filtrage.
 
+use crate::crop::Area;
 use crate::view::{View, ZOOM_STEP};
 use gtk4 as gtk;
 use gtk::subclass::prelude::*;
@@ -36,6 +37,8 @@ mod imp {
         pub beyond: Cell<bool>,
         /// Deplacement deja applique du glisser en cours, en pixels logiques.
         pub drag_done: Cell<(f64, f64)>,
+        /// Le glisser en cours a commence avec Maj : il emporte le fichier, il ne deplace pas l'image.
+        pub dragging_file: Cell<bool>,
         /// Defilement vertical accumule (molette sans Ctrl) : un cran = une image.
         pub wheel: Cell<f64>,
         pub on_resize: RefCell<Option<OnResize>>,
@@ -161,9 +164,11 @@ impl Canvas {
         drag.set_button(gdk::BUTTON_PRIMARY);
         drag.connect_drag_begin({
             let c = self.downgrade();
-            move |_, _, _| {
+            move |g, _, _| {
                 if let Some(c) = c.upgrade() {
                     c.imp().drag_done.set((0.0, 0.0));
+                    // Maj+glisser : le glisser-deposer du fichier (`dnd`), pas le pan
+                    c.imp().dragging_file.set(g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK));
                 }
             }
         });
@@ -171,6 +176,9 @@ impl Canvas {
             let c = self.downgrade();
             move |_, ox, oy| {
                 let Some(c) = c.upgrade() else { return };
+                if c.imp().dragging_file.get() {
+                    return;
+                }
                 let (dx, dy) = c.imp().drag_done.replace((ox, oy));
                 let s = c.scale_factor().max(1) as f64;
                 let (full, vp) = (c.full(), c.viewport());
@@ -266,6 +274,19 @@ impl Canvas {
 
     pub fn quarters(&self) -> u8 {
         self.imp().view.get().quarters()
+    }
+
+    /// Place de l'image sur l'ecran, en pixels logiques du canvas ; `None` sans image ou tournee (le cadre de crop
+    /// se dessine sur l'image telle que le fichier la contient).
+    pub fn image_area(&self) -> Option<Area> {
+        let full = self.full()?;
+        let view = self.imp().view.get();
+        if view.quarters() != 0 {
+            return None;
+        }
+        let r = view.rect(full, self.viewport());
+        let s = self.scale_factor().max(1) as f64;
+        Some(Area { x: r.x / s, y: r.y / s, w: r.w / s, h: r.h / s })
     }
 
     /// Autre image : fit, sans rotation. Sans notification (le controller sait deja que le `Full` est abandonne).

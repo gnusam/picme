@@ -130,7 +130,7 @@ impl Jobs for std::rc::Rc<Pool<Key>> {
 
 /// Seuls les types qui ont un decodeur ont un `Fit` et un `Full` ; les autres n'ont que la miniature freedesktop.
 /// Le RAW en a un avec la feature `raw`.
-fn decodable(kind: MediaKind) -> bool {
+pub fn decodable(kind: MediaKind) -> bool {
     kind != MediaKind::Video && (kind != MediaKind::Raw || cfg!(feature = "raw"))
 }
 

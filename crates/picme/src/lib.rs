@@ -3,6 +3,8 @@
 pub mod app;
 pub mod canvas;
 pub mod chrome;
+pub mod crop;
+pub mod dnd;
 pub mod fileops;
 pub mod filmstrip;
 pub mod keys;
