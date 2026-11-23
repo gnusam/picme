@@ -89,7 +89,7 @@ fn frame_of(sample: &gst::Sample) -> Option<Frame> {
     let (w, h) = (u32::try_from(w).ok().filter(|&w| w > 0)?, u32::try_from(h).ok().filter(|&h| h > 0)?);
     let map = sample.buffer()?.map_readable().ok()?;
     let need = w as usize * h as usize * 4;
-    (map.len() >= need).then(|| Frame { rgba: map[..need].to_vec(), w, h, full_w: w, full_h: h, low_res: false })
+    (map.len() >= need).then(|| Frame { rgba: map[..need].to_vec(), w, h, full_w: w, full_h: h, low_res: false, partial: false })
 }
 
 /// Ce que le lecteur apprend au main thread.

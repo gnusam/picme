@@ -237,6 +237,21 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_jpeg_is_refused_even_though_it_can_be_displayed() {
+        let tmp = TmpDir::new("crop-truncated");
+        let p = tmp.path().join("t.jpg");
+        let mut data = fs::read(fixtures_dir().join("a.jpg")).unwrap();
+        data.truncate(data.len() / 3);
+        fs::write(&p, &data).unwrap();
+        assert!(decode::decode_display(&p, Target::Full, usize::MAX).unwrap().partial);
+        for replace in [None, Some(&(|_: &Path| Ok(())) as Trash)] {
+            assert!(crop(&p, HALF, replace).is_err());
+        }
+        assert_eq!(fs::read(&p).unwrap(), data, "original intact");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1, "ni copie ni temporaire");
+    }
+
+    #[test]
     fn jpeg_crop_is_lossless_and_aligned_on_the_mcu() {
         let tmp = TmpDir::new("crop-jpeg");
         let p = copy(&tmp, "a.jpg");

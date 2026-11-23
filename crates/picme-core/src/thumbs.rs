@@ -249,6 +249,9 @@ impl ThumbStore {
         if !size.writable() {
             return Err(Error::Invalid(format!("picme n'ecrit pas la taille {}", size.dir())));
         }
+        if frame.partial {
+            return Err(Error::Invalid("miniature d'un decode partiel (fichier tronque)".into()));
+        }
         let max = size.px();
         if frame.w == 0 || frame.h == 0 || frame.w > max || frame.h > max {
             return Err(Error::Invalid(format!("miniature {}x{} hors de {max}x{max}", frame.w, frame.h)));
@@ -373,7 +376,7 @@ fn read_png(path: &Path, uri: &str, entry: &Entry, want: u32) -> Option<Frame> {
     let (full_w, full_h) = source_dims(entry, dims, (w, h))?;
     // jamais agrandie : plus petite que demande alors que l'image a de quoi remplir la demande (a un pixel pres)
     let low_res = w.max(h) + 1 < want.min(full_w.max(full_h));
-    Some(Frame { rgba, w, h, full_w, full_h, low_res })
+    Some(Frame { rgba, w, h, full_w, full_h, low_res, partial: false })
 }
 
 #[cfg(test)]
@@ -561,6 +564,16 @@ mod tests {
             assert!(matches!(store.store(&entry, &frame, size), Err(Error::Invalid(_))), "{size:?}");
         }
         assert!(!tmp.path().join("t").exists(), "rien n'est cree en cas de refus");
+    }
+
+    #[test]
+    fn a_partial_decode_is_never_written_as_a_thumbnail() {
+        let tmp = TmpDir::new("thumbs-partial");
+        let entry = copy_fixture(tmp.path(), "a.jpg");
+        let store = ThumbStore::new(tmp.path().join("t"));
+        let frame = Frame { partial: true, ..decode(&entry.path, Target::Fit(256, 256)).unwrap() };
+        assert!(matches!(store.store(&entry, &frame, ThumbSize::Large), Err(Error::Invalid(_))));
+        assert!(!tmp.path().join("t").exists());
     }
 
     #[test]
@@ -847,7 +860,7 @@ mod tests {
         assert_eq!(store.read(&entry, 256).map(|f| (f.w, f.h, f.low_res)), Some((256, 192, false)));
 
         // moins de 128 px : la spec n'en veut pas
-        let tiny = Frame { rgba: vec![9; 100 * 80 * 4], w: 100, h: 80, full_w: 100, full_h: 80, low_res: false };
+        let tiny = Frame { rgba: vec![9; 100 * 80 * 4], w: 100, h: 80, full_w: 100, full_h: 80, low_res: false, partial: false };
         let tiny_entry = Entry { path: entry.path.with_file_name("tiny.jpg"), ..entry.clone() };
         store.store_standard(&tiny_entry, tiny).unwrap();
         assert!(store.read(&tiny_entry, 256).is_none());

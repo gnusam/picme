@@ -56,6 +56,9 @@ pub struct Frame {
     /// Vrai pour une miniature de cache plus petite que ce qui etait demande alors que l'image a plus de pixels :
     /// elle n'est jamais agrandie, c'est l'affichage qui l'etire. Toujours faux pour un decode.
     pub low_res: bool,
+    /// Vrai pour un JPEG tronque ou corrompu decode par `decode_display` : une partie de l'image est grise. Une
+    /// frame partielle ne sert qu'a l'affichage (ni edition, ni miniature ecrite sur le disque).
+    pub partial: bool,
 }
 
 impl Frame {
@@ -71,7 +74,7 @@ impl Frame {
             return Ok(self);
         }
         let rgba = resize::resize_rgba(self.rgba, self.w, self.h, nw, nh, true)?;
-        Ok(Frame { rgba, w: nw, h: nh, full_w: self.full_w, full_h: self.full_h, low_res: self.low_res })
+        Ok(Frame { rgba, w: nw, h: nh, full_w: self.full_w, full_h: self.full_h, low_res: self.low_res, partial: self.partial })
     }
 }
 
@@ -100,12 +103,24 @@ pub fn decode(path: &Path, target: Target) -> Result<Frame> {
 
 /// Comme `decode`, avec un plafond explicite (en octets RGBA) pour `Full` : au-dela, l'image est reduite de
 /// facon a tenir dans `max_full_bytes`. Le plafond vaut la moitie du budget du cache (`--cache-mb`).
+/// Un fichier tronque ou corrompu est une erreur : c'est ce que l'edition (crop) doit lire.
 pub fn decode_capped(path: &Path, target: Target, max_full_bytes: usize) -> Result<Frame> {
+    decode_with(path, target, max_full_bytes, false)
+}
+
+/// Comme `decode_capped`, pour l'AFFICHAGE seulement : un JPEG tronque ou aux donnees corrompues rend ce que libjpeg
+/// a pu lire, `Frame::partial` vrai (le reste de l'image est gris). Cette `Frame` n'est jamais une entree d'edition
+/// ni une miniature a ecrire.
+pub fn decode_display(path: &Path, target: Target, max_full_bytes: usize) -> Result<Frame> {
+    decode_with(path, target, max_full_bytes, true)
+}
+
+fn decode_with(path: &Path, target: Target, max_full_bytes: usize, lenient: bool) -> Result<Frame> {
     if let Target::Fit(0, _) | Target::Fit(_, 0) = target {
         return Err(Error::Invalid("Fit demande une fenetre vide".into()));
     }
     match media::detect(path) {
-        Some(MediaKind::Jpeg) => jpeg::decode(path, target, max_full_bytes),
+        Some(MediaKind::Jpeg) => jpeg::decode(path, target, max_full_bytes, lenient),
         Some(kind @ (MediaKind::Png | MediaKind::Webp | MediaKind::Tiff)) => raster::decode(path, kind, target, max_full_bytes),
         Some(MediaKind::Heif) => heif::decode(path, target, max_full_bytes),
         Some(MediaKind::Jxl) => jxl::decode(path, target, max_full_bytes),
@@ -161,7 +176,7 @@ impl Plan {
     fn finish(&self, rgba: Vec<u8>, w: u32, h: u32, has_alpha: bool, orient: Orientation) -> Result<Frame> {
         let rgba = resize::resize_rgba(rgba, w, h, self.stored_w, self.stored_h, has_alpha)?;
         let (rgba, w, h) = orient.apply_rgba(rgba, self.stored_w, self.stored_h);
-        Ok(Frame { rgba, w, h, full_w: self.full_w, full_h: self.full_h, low_res: false })
+        Ok(Frame { rgba, w, h, full_w: self.full_w, full_h: self.full_h, low_res: false, partial: false })
     }
 }
 
@@ -298,7 +313,7 @@ mod tests {
         assert_eq!((small.w, small.h), (80, 60));
         let full = decode(&fx("a.jpg"), Target::Full).unwrap();
         let reduced = resize::resize_rgba(full.rgba.clone(), 640, 480, 80, 60, false).unwrap();
-        let reduced = Frame { rgba: reduced, w: 80, h: 60, full_w: 640, full_h: 480, low_res: false };
+        let reduced = Frame { rgba: reduced, w: 80, h: 60, full_w: 640, full_h: 480, low_res: false, partial: false };
         let d = mean_abs_diff(&small, &reduced);
         assert!(d < 6.0, "ecart moyen {d}");
     }
@@ -385,6 +400,33 @@ mod tests {
         std::fs::write(&txt, b"hello").unwrap();
         assert!(matches!(decode(&txt, Target::Full), Err(Error::Unsupported(_))));
         assert!(matches!(decode(&fx("a.jpg"), Target::Fit(0, 10)), Err(Error::Invalid(_))));
+    }
+
+    #[test]
+    fn a_truncated_jpeg_is_shown_partial_but_never_decoded_for_editing() {
+        let dir = crate::testutil::TmpDir::new("decode-truncated");
+        let whole = std::fs::read(fx("a.jpg")).unwrap();
+        for (name, keep) in [("third.jpg", whole.len() / 3), ("minus2.jpg", whole.len() - 2)] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, &whole[..keep]).unwrap();
+            for target in [Target::Preview, Target::Fit(320, 240), Target::Full] {
+                let err = decode_capped(&p, target, usize::MAX).unwrap_err();
+                assert!(matches!(&err, Error::Decode(m) if m.contains("TurboJPEG")), "{name} {target:?}: {err}");
+                let f = decode_display(&p, target, usize::MAX).unwrap();
+                assert!(f.partial, "{name} {target:?}");
+                assert_eq!((f.full_w, f.full_h), (640, 480));
+                assert_eq!(f.rgba.len(), f.w as usize * f.h as usize * 4);
+            }
+        }
+        // un fichier entier n'est jamais marque partiel, et l'en-tete seul ne donne rien a afficher
+        assert!(!decode_display(&fx("a.jpg"), Target::Full, usize::MAX).unwrap().partial);
+        let p = dir.path().join("head.jpg");
+        std::fs::write(&p, &whole[..20]).unwrap();
+        let r = decode_display(&p, Target::Full, usize::MAX);
+        assert!(r.is_err(), "{:?}", r.map(|f| (f.w, f.h, f.full_w, f.full_h, f.partial)));
+        // erreur fatale : refusee meme pour l'affichage
+        std::fs::write(&p, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]).unwrap();
+        assert!(decode_display(&p, Target::Full, usize::MAX).is_err());
     }
 
     #[test]

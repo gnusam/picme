@@ -274,7 +274,7 @@ mod tests {
     }
 
     fn frame() -> Frame {
-        Frame { rgba: vec![128; 256 * 192 * 4], w: 256, h: 192, full_w: 640, full_h: 480, low_res: false }
+        Frame { rgba: vec![128; 256 * 192 * 4], w: 256, h: 192, full_w: 640, full_h: 480, low_res: false, partial: false }
     }
 
     #[test]

@@ -661,7 +661,7 @@ impl<T: Clone> Controller<T> {
 
 /// Travail du pool `decode` : `Fit` et `Full`, plafond de `Full` a la moitie du budget du cache.
 pub fn decode_work(budget: usize) -> impl Fn(&Key) -> Result<Frame> + Send + Sync + 'static {
-    move |key: &Key| decode::decode_capped(&key.path, key.target, budget / 2)
+    move |key: &Key| decode::decode_display(&key.path, key.target, budget / 2)
 }
 
 /// Travail du pool `thumbs` : miniature freedesktop si elle est a jour, sinon decode `Preview`. Un `Preview` demande
@@ -669,7 +669,7 @@ pub fn decode_work(budget: usize) -> impl Fn(&Key) -> Result<Frame> + Send + Syn
 /// plus petite qui couvre `STRIP_W` x `STRIP_H` ; `Frame::low_res` dit quand elle est plus petite que demande. Un
 /// `Preview` decode qui a la taille d'une miniature `large` (256 px de grand cote, ou l'image entiere si elle est
 /// plus petite) part au thread d'ecriture (`large` et `normal`), sauf si un autre programme a marque le fichier en
-/// echec ; la thumbnail embarquee d'un HEIF, plus petite, n'est jamais ecrite. Une cle `Strip` (filmstrip) reduit
+/// echec ; la thumbnail embarquee d'un HEIF, plus petite, et un decode partiel (JPEG tronque) ne sont jamais ecrits. Une cle `Strip` (filmstrip) reduit
 /// le resultat a `STRIP_W` x `STRIP_H`.
 pub fn thumb_work(store: Option<ThumbStore>, writer: FileOpsHandle) -> impl Fn(&Key) -> Result<Frame> + Send + Sync + 'static {
     move |key: &Key| {
@@ -682,11 +682,12 @@ pub fn thumb_work(store: Option<ThumbStore>, writer: FileOpsHandle) -> impl Fn(&
                 // une video n'a pas de decodeur : sa premiere image vient de GStreamer, reduite comme un Preview
                 let frame = match kind {
                     MediaKind::Video => crate::video::first_frame(&key.path)?.shrink_to(PREVIEW_SIZE, PREVIEW_SIZE)?,
-                    _ => decode::decode(&key.path, Target::Preview)?,
+                    _ => decode::decode_display(&key.path, Target::Preview, decode::DEFAULT_BUDGET_BYTES / 2)?,
                 };
                 let large = frame.w.max(frame.h) == PREVIEW_SIZE || (frame.w, frame.h) == (frame.full_w, frame.full_h);
                 if let Some(store) = &store
                     && large
+                    && !frame.partial
                     && !store.marked_failed(&entry)
                 {
                     writer.store_thumb(entry, frame.clone());
@@ -769,7 +770,7 @@ mod tests {
     const FULL: (u32, u32) = (4000, 3000);
 
     fn frame(w: u32, h: u32) -> Frame {
-        Frame { rgba: vec![0; w as usize * h as usize * 4], w, h, full_w: FULL.0, full_h: FULL.1, low_res: false }
+        Frame { rgba: vec![0; w as usize * h as usize * 4], w, h, full_w: FULL.0, full_h: FULL.1, low_res: false, partial: false }
     }
 
     /// Dossier de `n` fichiers vides `i00.jpg`, `i01.jpg`... listes, et le courant sur `i{cur}`.
@@ -1480,6 +1481,25 @@ mod tests {
         assert_eq!((f.w, f.h), (256, 192));
         ops.finish();
         assert!(!store.path_of(&entry, ThumbSize::Large).exists() && !store.path_of(&entry, ThumbSize::Normal).exists());
+    }
+
+    #[test]
+    fn a_truncated_jpeg_is_displayed_and_decoded_for_the_pool_but_never_gets_a_thumbnail() {
+        let dir = TmpDir::new("ctl-truncated");
+        let path = dir.path().join("t.jpg");
+        let mut data = std::fs::read(picme_core::fixtures_dir().join("a.jpg")).unwrap();
+        data.truncate(data.len() / 3);
+        std::fs::write(&path, &data).unwrap();
+        let entry = dir::stat_entry(&path).unwrap();
+        let store = ThumbStore::new(dir.path().join("thumbnails"));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
+
+        let f = thumb_work(Some(store.clone()), ops.handle())(&Key::of(&entry, Target::Preview)).unwrap();
+        assert!(f.partial && (f.w, f.h) == (256, 192));
+        assert!(decode_work(256 << 20)(&Key::of(&entry, Target::Fit(800, 600))).unwrap().partial);
+        ops.finish();
+        assert!(!store.path_of(&entry, ThumbSize::Large).exists() && !store.path_of(&entry, ThumbSize::Normal).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), data);
     }
 
     #[test]

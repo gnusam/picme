@@ -79,6 +79,10 @@ Conflit avec le déplacement de l'image : quand l'image est ajustée à la fenê
 
 Vers picme : déposer un fichier sur la fenêtre l'ouvre et son dossier devient le dossier courant. picme n'ouvre que le fichier : il ne le déplace ni ne le supprime, et la source ne le perd que si elle le déplace elle-même. Un glisser parti de la même fenêtre est ignoré.
 
+## Limites
+
+- Un JPEG tronqué ou aux données corrompues s'affiche tel que libjpeg le lit (la partie manquante est grise) ; il n'est ni tourné ni recadré, aucune miniature n'en est écrite.
+
 ## Compilation
 
 Rien ne se compile sur le poste : tout passe par le compose du projet (image Debian, `network_mode: none`, sauf le service `fetch`).
