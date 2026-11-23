@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 picme-core = { path = "../picme-core" }
+# resultats des pools vers le main thread (meme version que picme-core)
+async-channel = "2.5"
 gtk4.workspace = true
 # alignes sur gst-plugin-gtk4 : utilises a partir du bloc 6 (video), declares ici pour verifier l'absence de doublon
 gstreamer.workspace = true
