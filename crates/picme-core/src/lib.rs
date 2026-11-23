@@ -6,6 +6,7 @@ pub mod dir;
 pub mod error;
 pub mod media;
 pub mod orient;
+pub mod pool;
 pub mod thumbs;
 
 pub use error::{Error, Result};

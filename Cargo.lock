@@ -1338,6 +1338,7 @@ dependencies = [
 name = "picme-core"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "fast_image_resize",
  "image",
  "jxl-oxide",

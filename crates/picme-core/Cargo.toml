@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# resultats du pool vers le main thread (deja dans le graphe par gstreamer)
+async-channel = "2.5"
 fast_image_resize = "6.2"
 # formats limites a ceux que picme-core decode via `image` (JPEG : turbojpeg, HEIC et AVIF : libheif, JXL : jxl-oxide)
 image = { version = "0.25", default-features = false, features = ["png", "tiff", "webp"] }
