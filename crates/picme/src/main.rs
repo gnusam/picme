@@ -1,9 +1,15 @@
 use gtk4 as gtk;
 use gtk::{gdk, glib, prelude::*};
 use picme::app::{self, Controller, Level, Show};
-use picme::canvas::Canvas;
+use picme::canvas::{self, Canvas};
+use picme::chrome::Chrome;
 use picme::fileops::FileOps;
-use picme_core::decode::{DEFAULT_BUDGET_BYTES, Frame};
+use picme::filmstrip::Filmstrip;
+use picme::keys::{self, Action};
+use picme::monitor::DirWatch;
+use picme::osd::{self, Osd};
+use picme::view::ZOOM_STEP;
+use picme_core::decode::{DEFAULT_BUDGET_BYTES, Frame, Target};
 use picme_core::dir::{self, Entry};
 use picme_core::pool::{self, Key, Pool};
 use picme_core::thumbs::{self, ThumbStore};
@@ -15,6 +21,16 @@ use std::time::{Duration, Instant};
 
 // dependances declarees d'avance (gstreamer : bloc 6), pas encore utilisees
 use {gstgtk4 as _, gstreamer as _};
+
+const CSS: &str = "
+window { background: #000; }
+.osd { background: rgba(0, 0, 0, 0.6); color: #eee; padding: 4px 10px; border-radius: 6px; font-size: 13px; }
+.strip-bar { background: rgba(0, 0, 0, 0.7); }
+.strip { background: transparent; }
+.strip row { padding: 0; margin: 0; min-height: 0; background: transparent; }
+.strip row:selected { background: transparent; outline: 2px solid #fff; outline-offset: -2px; }
+.strip-cell { background: rgba(255, 255, 255, 0.08); }
+";
 
 /// `PICME_TRACE=1` : horodatages sur stderr, en ms depuis le debut de `main`.
 #[derive(Clone, Copy)]
@@ -64,6 +80,12 @@ struct Ui {
     painted_image: Cell<bool>,
     /// Fin de repetition programmee (`Controller::settle`).
     settle: RefCell<Option<glib::SourceId>>,
+    osd: Rc<Osd>,
+    strip: Rc<Filmstrip>,
+    chrome: Rc<Chrome>,
+    /// Le courant a la derniere mise a jour : un autre fichier remet la vue au fit.
+    last_current: RefCell<Option<PathBuf>>,
+    watch: RefCell<Option<DirWatch>>,
 }
 
 impl Ui {
@@ -72,6 +94,7 @@ impl Ui {
             Show::Keep => {}
             Show::Image(img) => {
                 self.canvas.set_image(&img.texture, img.full_w, img.full_h);
+                self.announce();
                 if let Some(b) = self.bench.borrow_mut().as_mut() {
                     if let Some(t) = b.waiting.take() {
                         b.painting = Some((t, img.level));
@@ -84,18 +107,46 @@ impl Ui {
             Show::Clear => self.canvas.clear(),
             Show::Failed(msg) => {
                 eprintln!("picme : {msg}");
+                self.osd.message(&msg);
                 self.canvas.clear();
             }
         }
-        if let Some(e) = self.ctl.borrow().current() {
-            let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let current = self.ctl.borrow().current().map(|e| e.path.clone());
+        if let Some(path) = &current {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             if self.window.title().as_deref() != Some(name.as_str()) {
                 self.window.set_title(Some(&name));
             }
         }
+        if *self.last_current.borrow() != current {
+            *self.last_current.borrow_mut() = current;
+            self.canvas.reset_view();
+            self.chrome.pulse();
+            self.announce();
+        }
+        self.sync();
+    }
+
+    /// Nom, position et zoom du courant, un instant par-dessus l'image.
+    fn announce(&self) {
+        let ctl = self.ctl.borrow();
+        let Some(e) = ctl.current() else { return };
+        let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let position = ctl.index().map(|i| (i + 1, ctl.entries().len()));
+        self.osd.show_info(&osd::format_info(&name, position, self.canvas.percent()));
+    }
+
+    /// Le filmstrip suit la liste et le courant du controller.
+    fn sync(&self) {
+        let ctl = self.ctl.borrow();
+        self.strip.sync(ctl.entries(), ctl.rev(), ctl.index());
     }
 
     fn on_result(&self, key: Key, result: picme_core::Result<Frame>) {
+        if key.target == Target::Strip {
+            self.strip.on_result(key, result);
+            return;
+        }
         let show = self.ctl.borrow_mut().on_result(key, result);
         self.apply(show);
     }
@@ -103,12 +154,60 @@ impl Ui {
     fn go(self: &Rc<Self>, delta: isize) {
         let from = self.ctl.borrow().index();
         let show = self.ctl.borrow_mut().go(delta);
-        self.apply(show);
         // touche maintenue : les Fit attendent REPEAT_GAP sans navigation (touche tenue en bout de dossier : pas de
-        // navigation, le timeout deja arme n'est pas repousse)
-        let rearm = self.ctl.borrow().repeating() && self.ctl.borrow().index() != from;
+        // navigation, le timeout deja arme n'est pas repousse) ; le filmstrip se tait et ne suit plus pendant ce temps,
+        // avant `apply` pour que sa synchronisation le sache
+        let repeating = self.ctl.borrow().repeating();
+        self.strip.pause(repeating);
+        self.apply(show);
+        let rearm = repeating && self.ctl.borrow().index() != from;
         if rearm {
             self.schedule_settle(app::REPEAT_GAP);
+        }
+    }
+
+    /// Un autre programme a touche ces fichiers du dossier : la liste suit.
+    fn reconcile(&self, paths: Vec<PathBuf>) {
+        for path in &paths {
+            let show = self.ctl.borrow_mut().reconcile(path);
+            self.apply(show);
+        }
+        self.trace.mark(&format!("monitor : {} chemins, {} entrees", paths.len(), self.ctl.borrow().entries().len()));
+    }
+
+    fn watch_dir(self: &Rc<Self>) {
+        let Some(dir) = self.ctl.borrow().dir().map(|d| d.to_path_buf()) else { return };
+        let ui = Rc::downgrade(self);
+        match DirWatch::new(&dir, move |paths| {
+            if let Some(ui) = ui.upgrade() {
+                ui.reconcile(paths);
+            }
+        }) {
+            Ok(w) => *self.watch.borrow_mut() = Some(w),
+            Err(e) => eprintln!("picme : {} non surveille : {e}", dir.display()),
+        }
+    }
+
+    fn act(self: &Rc<Self>, action: Action, main_loop: &glib::MainLoop) {
+        match action {
+            Action::Next => self.go(1),
+            Action::Prev => self.go(-1),
+            Action::First => self.go(isize::MIN),
+            Action::Last => self.go(isize::MAX),
+            Action::ToggleZoom => self.canvas.toggle_zoom(),
+            Action::ZoomIn => self.canvas.zoom_by(ZOOM_STEP),
+            Action::ZoomOut => self.canvas.zoom_by(1.0 / ZOOM_STEP),
+            Action::Fit => self.canvas.fit(),
+            Action::RotateRight => self.canvas.rotate(1),
+            Action::RotateLeft => self.canvas.rotate(-1),
+            Action::Fullscreen => {
+                if self.window.is_fullscreen() {
+                    self.window.unfullscreen();
+                } else {
+                    self.window.fullscreen();
+                }
+            }
+            Action::Quit => main_loop.quit(),
         }
     }
 
@@ -125,6 +224,8 @@ impl Ui {
             // timeout servi un peu avant REPEAT_GAP apres la derniere navigation : on repasse
             if ui.ctl.borrow().repeating() {
                 ui.schedule_settle(Duration::from_millis(5));
+            } else {
+                ui.strip.pause(false);
             }
         }));
     }
@@ -214,7 +315,8 @@ fn main() {
     let fileops = FileOps::new(store.clone());
     let first_preview = AtomicBool::new(true);
     let thumb_work = app::thumb_work(store, fileops.handle());
-    let thumbs_pool = Pool::new(
+    // le pool `thumbs` sert le controller (`Preview`) et le filmstrip (`Strip`) : un seul proprietaire partage
+    let thumbs_pool = Rc::new(Pool::new(
         "picme-thumbs",
         pool::THUMB_THREADS,
         move |k: &Key| {
@@ -226,17 +328,9 @@ fn main() {
             r
         },
         tx.clone(),
-    );
+    ));
     let decode_pool = Pool::new("picme-decode", pool::decode_threads(), app::decode_work(budget), tx);
-    let mut ctl = Controller::new(
-        budget,
-        Box::new(decode_pool),
-        Box::new(thumbs_pool),
-        Box::new(|f: Frame| {
-            let stride = f.w as usize * 4;
-            gdk::MemoryTexture::new(f.w as i32, f.h as i32, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(f.rgba), stride).upcast()
-        }),
-    );
+    let mut ctl = Controller::new(budget, Box::new(decode_pool), Box::new(thumbs_pool.clone()), Box::new(canvas::texture_of));
     if let Show::Failed(msg) = ctl.open(&arg) {
         eprintln!("picme : {msg}");
         std::process::exit(1);
@@ -262,7 +356,7 @@ fn main() {
     trace.mark("gtk init");
 
     let css = gtk::CssProvider::new();
-    css.load_from_string("window { background: #000; }");
+    css.load_from_string(CSS);
     gtk::style_context_add_provider_for_display(&gdk::Display::default().expect("display"), &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
     let main_loop = glib::MainLoop::new(None, false);
@@ -270,7 +364,21 @@ fn main() {
     window.set_decorated(false);
     window.set_default_size(1280, 800);
     let canvas = Canvas::new();
-    window.set_child(Some(&canvas));
+    let strip = Filmstrip::new(thumbs_pool);
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideUp);
+    revealer.set_transition_duration(150);
+    revealer.set_halign(gtk::Align::Fill);
+    revealer.set_valign(gtk::Align::End);
+    revealer.set_child(Some(strip.widget()));
+    let osd = Osd::new();
+    // le canvas prend toute la fenetre ; la bande et l'OSD flottent par-dessus
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&canvas));
+    overlay.add_overlay(&revealer);
+    osd.attach(&overlay);
+    window.set_child(Some(&overlay));
+    let chrome = Chrome::new(&window, &revealer);
 
     let bench = std::env::var("PICME_BENCH_NAV").ok().and_then(|v| {
         let (n, ms) = v.split_once(':').unwrap_or((&v, "40"));
@@ -294,6 +402,42 @@ fn main() {
         bench: RefCell::new(bench),
         painted_image: Cell::new(false),
         settle: RefCell::default(),
+        osd,
+        strip: strip.clone(),
+        chrome,
+        last_current: RefCell::default(),
+        watch: RefCell::default(),
+    });
+    ui.watch_dir();
+
+    canvas.connect_view({
+        let ui = Rc::downgrade(&ui);
+        move |beyond| {
+            if let Some(ui) = ui.upgrade() {
+                // au-dessus du fit : le controller demande le `Full` ; de retour au fit, il le libere
+                let show = ui.ctl.borrow_mut().set_full(beyond);
+                ui.apply(show);
+                ui.announce();
+            }
+        }
+    });
+    canvas.connect_nav({
+        let ui = Rc::downgrade(&ui);
+        move |delta| {
+            if let Some(ui) = ui.upgrade() {
+                ui.go(delta);
+            }
+        }
+    });
+    strip.connect_activate({
+        let ui = Rc::downgrade(&ui);
+        move |pos| {
+            let Some(ui) = ui.upgrade() else { return };
+            let from = ui.ctl.borrow().index();
+            if let Some(from) = from {
+                ui.go(pos as isize - from as isize);
+            }
+        }
     });
 
     // resultats deja prets (le Preview, souvent) : dans le premier frame
@@ -355,28 +499,26 @@ fn main() {
                 if let Some(ui) = ui.upgrade() {
                     let show = ui.ctl.borrow_mut().set_viewport(w, h);
                     ui.apply(show);
+                    // une fenetre plus grande peut avoir rendu le zoom inferieur au fit
+                    ui.canvas.resync();
                 }
             }));
         }
     });
 
-    // touches minimales (le reste au bloc 4)
-    let keys = gtk::EventControllerKey::new();
-    keys.connect_key_pressed({
+    // en phase Capture : la liste du filmstrip ne doit pas manger les fleches
+    let key_ctl = gtk::EventControllerKey::new();
+    key_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
+    key_ctl.connect_key_pressed({
         let ui = Rc::downgrade(&ui);
         let main_loop = main_loop.clone();
-        move |_, key, _, _| {
-            let Some(ui) = ui.upgrade() else { return glib::Propagation::Proceed };
-            match key {
-                gdk::Key::Right | gdk::Key::space => ui.go(1),
-                gdk::Key::Left | gdk::Key::BackSpace => ui.go(-1),
-                gdk::Key::q | gdk::Key::Escape => main_loop.quit(),
-                _ => return glib::Propagation::Proceed,
-            }
+        move |_, key, _, state| {
+            let (Some(ui), Some(action)) = (ui.upgrade(), keys::action(key, state)) else { return glib::Propagation::Proceed };
+            ui.act(action, &main_loop);
             glib::Propagation::Stop
         }
     });
-    window.add_controller(keys);
+    window.add_controller(key_ctl);
 
     window.connect_close_request({
         let main_loop = main_loop.clone();
