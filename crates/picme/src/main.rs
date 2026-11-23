@@ -2,30 +2,33 @@ use gtk4 as gtk;
 use gtk::{gdk, glib, prelude::*};
 use picme::app::{self, Controller, Level, Show};
 use picme::canvas::{self, Canvas};
+use gstreamer as gst;
 use picme::chrome::Chrome;
+use picme::crop::Cropper;
+use picme::dnd;
 use picme::fileops::{Done, FileOps, FileOpsHandle};
 use picme::filmstrip::Filmstrip;
-use picme::keys::{self, Action};
+use picme::keys::{self, Action, Ctx};
 use picme::monitor::DirWatch;
 use picme::osd::{self, Osd};
+use picme::video::{self, Player};
 use picme::view::ZOOM_STEP;
 use picme_core::decode::{DEFAULT_BUDGET_BYTES, Frame, Target};
 use picme_core::dir::{self, Entry};
+use picme_core::media::MediaKind;
 use picme_core::orient::Orientation;
 use picme_core::pool::{self, Key, Pool};
 use picme_core::thumbs::ThumbStore;
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// dependances declarees d'avance (gstreamer : bloc 6), pas encore utilisees
-use {gstgtk4 as _, gstreamer as _};
-
 const CSS: &str = "
 window { background: #000; }
 .osd { background: rgba(0, 0, 0, 0.6); color: #eee; padding: 4px 10px; border-radius: 6px; font-size: 13px; }
+.live-badge { background: rgba(0, 0, 0, 0.6); color: #eee; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
 .strip-bar { background: rgba(0, 0, 0, 0.7); }
 .strip { background: transparent; }
 .strip row { padding: 0; margin: 0; min-height: 0; background: transparent; }
@@ -92,10 +95,36 @@ struct Ui {
     turned: Cell<i32>,
     /// Keycode de la touche Suppr enfoncee : sa repetition ne vide pas le dossier.
     delete_held: Cell<Option<u32>>,
+    /// Cadre de recadrage (C), par-dessus le canvas.
+    cropper: Rc<Cropper>,
+    /// Lecteur en cours : le fichier qu'il lit (la video courante, ou le `.mov` d'une Live Photo tenue par L).
+    player: RefCell<Option<(PathBuf, Player)>>,
+    /// Image de la video, par-dessus le canvas qui montre en dessous la miniature de la video.
+    video_view: gtk::Picture,
+    /// Son voulu (M) : coupe par defaut, et coupe de nouveau si la sortie audio manque.
+    audio: Cell<bool>,
+    /// L est tenue : le `.mov` de la Live Photo joue.
+    live_held: Cell<bool>,
+    live_badge: gtk::Label,
+    /// Les scans de dossier (au demarrage, puis a chaque fichier depose d'un autre dossier).
+    scan_tx: async_channel::Sender<ScanResult>,
+}
+
+type ScanResult = (PathBuf, std::io::Result<Vec<Entry>>);
+
+/// Liste `dir` sur un autre thread : la fenetre ne l'attend pas.
+fn spawn_scan(dir: PathBuf, tx: async_channel::Sender<ScanResult>) {
+    std::thread::Builder::new()
+        .name("picme-scan".into())
+        .spawn(move || {
+            let list = dir::list(&dir);
+            let _ = tx.send_blocking((dir, list));
+        })
+        .expect("thread scan");
 }
 
 impl Ui {
-    fn apply(&self, show: Show<gdk::Texture>) {
+    fn apply(self: &Rc<Self>, show: Show<gdk::Texture>) {
         match show {
             Show::Keep => {}
             Show::Image(img) => {
@@ -126,12 +155,210 @@ impl Ui {
         }
         if *self.last_current.borrow() != current {
             *self.last_current.borrow_mut() = current;
+            // un autre fichier : ni cadre de crop, ni lecture, ni Live Photo tenue
+            self.cropper.stop();
+            self.live_held.set(false);
+            self.stop_player();
             self.reset_view();
             self.chrome.pulse();
             self.announce();
         }
+        self.live_badge.set_visible(self.ctl.borrow().current().is_some_and(|e| e.live_mov.is_some()));
         self.sync();
         self.sync_turns();
+        self.sync_player();
+    }
+
+    /// Ce que les touches voient de la vue.
+    fn ctx(&self) -> Ctx {
+        Ctx { video: self.ctl.borrow().current().is_some_and(|e| e.kind == MediaKind::Video), crop: self.cropper.is_active() }
+    }
+
+    /// Lit `path` a `start`, a la place du lecteur en cours.
+    fn play(self: &Rc<Self>, path: PathBuf, start: gst::ClockTime, paused: bool) {
+        self.stop_player();
+        let ui = Rc::downgrade(self);
+        let opened = Player::open(&path, self.audio.get(), start, paused, move |event| {
+            if let Some(ui) = ui.upgrade() {
+                ui.on_player_event(event);
+            }
+        });
+        match opened {
+            Ok(player) => {
+                self.video_view.set_paintable(Some(player.paintable()));
+                self.video_view.set_visible(true);
+                *self.player.borrow_mut() = Some((path, player));
+            }
+            Err(e) => {
+                eprintln!("picme : lecture de {} : {e}", path.display());
+                self.osd.message(&format!("lecture impossible : {e}"));
+            }
+        }
+    }
+
+    /// Ferme le lecteur : le fichier est relache (corbeille, deplacement, fermeture).
+    fn stop_player(&self) {
+        let player = self.player.borrow_mut().take();
+        if player.is_some() {
+            self.video_view.set_paintable(None::<&gdk::Paintable>);
+            self.video_view.set_visible(false);
+        }
+    }
+
+    /// La video courante se lit des qu'elle est la vue posee, pas pendant la repetition d'une touche (les videos
+    /// survolees ne s'ouvrent pas) ; sur une autre vue, le lecteur est ferme.
+    fn sync_player(self: &Rc<Self>) {
+        if self.live_held.get() {
+            return;
+        }
+        let want = {
+            let ctl = self.ctl.borrow();
+            ctl.current().filter(|e| e.kind == MediaKind::Video && !ctl.repeating()).map(|e| e.path.clone())
+        };
+        let playing = self.player.borrow().as_ref().map(|(p, _)| p.clone());
+        match (want, playing) {
+            (Some(w), Some(p)) if w == p => {}
+            (Some(w), _) if !self.cropper.is_active() => self.play(w, gst::ClockTime::ZERO, false),
+            (None, Some(_)) => self.stop_player(),
+            _ => {}
+        }
+    }
+
+    fn on_player_event(self: &Rc<Self>, event: video::Event) {
+        match event {
+            video::Event::Eos => {
+                if let Some((_, p)) = self.player.borrow().as_ref() {
+                    p.finish();
+                }
+            }
+            video::Event::Error(msg) => {
+                let Some((path, audio, at, paused)) =
+                    self.player.borrow().as_ref().map(|(path, p)| (path.clone(), p.audio(), p.position(), p.is_paused()))
+                else {
+                    return;
+                };
+                eprintln!("picme : lecture de {} : {msg}", path.display());
+                // la sortie audio manque (ou refuse) : la meme video, sans le son. Hors de l'evenement du bus du lecteur
+                // que `play` detruit
+                if audio {
+                    self.audio.set(false);
+                    self.osd.message("sortie audio indisponible : son coupé");
+                    let ui = Rc::downgrade(self);
+                    glib::idle_add_local_once(move || {
+                        if let Some(ui) = ui.upgrade() {
+                            ui.play(path, at, paused);
+                        }
+                    });
+                } else {
+                    // le lecteur reste en place : `sync_player` ne le rouvrirait que pour echouer de nouveau
+                    self.osd.message(&format!("lecture impossible : {msg}"));
+                }
+            }
+        }
+    }
+
+    /// Espace sur une video : pause et reprise ; sans lecteur (touche tenue puis relachee), elle se lance.
+    fn pause(self: &Rc<Self>) {
+        let state = self.player.borrow().as_ref().map(|(_, p)| (p.toggle_pause(), p.position()));
+        match state {
+            Some((true, at)) => self.osd.message(&format!("pause  {}", video::clock(at))),
+            Some((false, _)) => self.osd.message("lecture"),
+            None => self.sync_player(),
+        }
+    }
+
+    /// Maj+fleches : saute de `SEEK_STEP` secondes.
+    fn seek(&self, forward: bool) {
+        if let Some((_, p)) = self.player.borrow().as_ref() {
+            let step = if forward { video::SEEK_STEP } else { -video::SEEK_STEP };
+            p.seek_by(step);
+            self.osd.message(&format!("{step:+} s"));
+        }
+    }
+
+    /// M : le son de la video. Le lecteur est recree a la meme position : `playbin` n'ouvre la sortie audio qu'au
+    /// demarrage.
+    fn mute(self: &Rc<Self>) {
+        let audio = !self.audio.get();
+        self.audio.set(audio);
+        self.osd.message(if audio { "son activé" } else { "son coupé" });
+        let state = self.player.borrow().as_ref().map(|(path, p)| (path.clone(), p.position(), p.is_paused()));
+        if let Some((path, at, paused)) = state {
+            self.play(path, at, paused);
+        }
+    }
+
+    /// L tenue : le `.mov` de la Live Photo joue par-dessus l'image.
+    fn live_start(self: &Rc<Self>) {
+        if self.live_held.get() || self.cropper.is_active() {
+            return;
+        }
+        let mov = self.ctl.borrow().current().and_then(|e| e.live_mov.clone());
+        if let Some(mov) = mov {
+            self.live_held.set(true);
+            self.play(mov, gst::ClockTime::ZERO, false);
+        }
+    }
+
+    /// L relachee : l'image reprend la place.
+    fn live_end(self: &Rc<Self>) {
+        if self.live_held.replace(false) {
+            self.stop_player();
+            self.sync_player();
+        }
+    }
+
+    /// C : le cadre de recadrage, sur l'image au fit telle que le fichier la contient.
+    fn crop_start(self: &Rc<Self>) {
+        let image = self.ctl.borrow().current().is_some_and(|e| app::decodable(e.kind));
+        if !image || !self.canvas.has_image() {
+            self.osd.message("recadrage : pas d'image");
+        } else if self.canvas.quarters() != 0 {
+            self.osd.message("recadrage : la vue est tournée (Ctrl+flèches, ou R en cours)");
+        } else {
+            self.canvas.fit();
+            self.cropper.start();
+            self.osd.message("recadrage : Entrée copie, Maj+Entrée remplace, Échap annule");
+        }
+    }
+
+    /// Entree (copie) et Maj+Entree (remplacement, l'original va a la corbeille) : le thread d'ecriture recadre.
+    fn crop_apply(&self, replace: bool) {
+        let frac = self.cropper.frac();
+        self.cropper.stop();
+        let Some(path) = self.ctl.borrow().current().map(|e| e.path.clone()) else { return };
+        if !self.fileops.crop(path, frac, replace) {
+            self.osd.message("recadrage non fait : écritures arrêtées");
+        }
+    }
+
+    /// Ouvre `path` (fichier depose, copie d'un crop) ; d'un autre dossier, la liste est ce fichier en attendant le
+    /// scan de son dossier, qui devient le courant.
+    fn open_path(self: &Rc<Self>, path: &Path) {
+        let before = self.ctl.borrow().dir().map(Path::to_path_buf);
+        let show = self.ctl.borrow_mut().open(path);
+        if let Show::Failed(msg) = show {
+            eprintln!("picme : {msg}");
+            self.osd.message(&msg);
+            return;
+        }
+        if self.ctl.borrow().dir().map(Path::to_path_buf) != before {
+            if let Some(dir) = self.ctl.borrow().dir().map(Path::to_path_buf) {
+                spawn_scan(dir, self.scan_tx.clone());
+            }
+            self.watch_dir();
+        }
+        self.apply(show);
+    }
+
+    /// La cible d'un glisser a deplace ces fichiers (action Move reussie) : ils quittent la vue, le `.mov` d'une Live
+    /// Photo avant son image (il ne reste pas seul, a se lire).
+    fn moved_away(self: &Rc<Self>, paths: Vec<PathBuf>) {
+        self.stop_player();
+        for path in paths.iter().rev() {
+            let show = self.ctl.borrow_mut().reconcile(path);
+            self.apply(show);
+        }
     }
 
     /// Vue au fit et sans rotation, plus les rotations R que l'image affichee ne contient pas encore.
@@ -155,7 +382,7 @@ impl Ui {
     }
 
     /// R et Maj+R : la vue tourne tout de suite, le fichier ensuite (thread d'ecriture).
-    fn turn(&self, quarters: i32) {
+    fn turn(self: &Rc<Self>, quarters: i32) {
         let Some(path) = self.ctl.borrow_mut().turn(quarters) else { return };
         self.sync_turns();
         let turn = if quarters > 0 { Orientation::Rotate90 } else { Orientation::Rotate270 };
@@ -167,7 +394,9 @@ impl Ui {
     }
 
     /// Suppr (corbeille) et Maj+Suppr (definitif) : le courant quitte la liste tout de suite, le disque suit.
-    fn remove(&self, trash: bool) {
+    fn remove(self: &Rc<Self>, trash: bool) {
+        // le fichier est relache avant la corbeille
+        self.stop_player();
         let Some((paths, show)) = self.ctl.borrow_mut().remove_current() else { return };
         self.apply(show);
         let sent = if trash { self.fileops.trash(paths.clone()) } else { self.fileops.delete(paths.clone()) };
@@ -182,7 +411,7 @@ impl Ui {
 
     /// Compte rendu du thread d'ecriture : la liste suit le disque, la vue du fichier touche repart du fit, l'OSD
     /// le dit.
-    fn on_done(&self, done: Done) {
+    fn on_done(self: &Rc<Self>, done: Done) {
         let current = self.ctl.borrow().current().map(|e| e.path.clone());
         let touched = match &done {
             Done::Rotated { path, result } => {
@@ -194,6 +423,10 @@ impl Ui {
                 if let Ok(c) = result {
                     let show = self.ctl.borrow_mut().reconcile(&c.path);
                     self.apply(show);
+                    // la copie s'ouvre si on est encore sur l'original ; un original remplace garde sa place
+                    if !c.replaced && current.as_ref() == Some(path) {
+                        self.open_path(&c.path);
+                    }
                 }
                 vec![path.clone()]
             }
@@ -233,7 +466,7 @@ impl Ui {
         self.strip.sync(ctl.entries(), ctl.rev(), ctl.index());
     }
 
-    fn on_result(&self, key: Key, result: picme_core::Result<Frame>) {
+    fn on_result(self: &Rc<Self>, key: Key, result: picme_core::Result<Frame>) {
         if key.target == Target::Strip {
             self.strip.on_result(key, result);
             return;
@@ -258,7 +491,7 @@ impl Ui {
     }
 
     /// Un autre programme a touche ces fichiers du dossier : la liste suit.
-    fn reconcile(&self, paths: Vec<PathBuf>) {
+    fn reconcile(self: &Rc<Self>, paths: Vec<PathBuf>) {
         for path in &paths {
             let show = self.ctl.borrow_mut().reconcile(path);
             self.apply(show);
@@ -285,6 +518,8 @@ impl Ui {
             Action::Prev => self.go(-1),
             Action::First => self.go(isize::MIN),
             Action::Last => self.go(isize::MAX),
+            // le zoom est celui de l'image : la video, par-dessus, ne le suit pas
+            Action::ToggleZoom | Action::ZoomIn | Action::ZoomOut if self.player.borrow().is_some() => {}
             Action::ToggleZoom => self.canvas.toggle_zoom(),
             Action::ZoomIn => self.canvas.zoom_by(ZOOM_STEP),
             Action::ZoomOut => self.canvas.zoom_by(1.0 / ZOOM_STEP),
@@ -302,7 +537,18 @@ impl Ui {
                     self.window.fullscreen();
                 }
             }
-            Action::Quit => main_loop.quit(),
+            Action::Quit => {
+                self.stop_player();
+                main_loop.quit();
+            }
+            Action::Crop => self.crop_start(),
+            Action::CropCancel => self.cropper.stop(),
+            Action::CropApply { replace } => self.crop_apply(replace),
+            Action::Pause => self.pause(),
+            Action::SeekForward => self.seek(true),
+            Action::SeekBack => self.seek(false),
+            Action::Mute => self.mute(),
+            Action::Live => self.live_start(),
         }
     }
 
@@ -434,15 +680,9 @@ fn main() {
     trace.mark("preview submitted");
 
     // scan du dossier sur un autre thread : la fenetre ne l'attend pas
-    let (scan_tx, scan_rx) = async_channel::bounded::<(PathBuf, std::io::Result<Vec<Entry>>)>(1);
+    let (scan_tx, scan_rx) = async_channel::unbounded::<ScanResult>();
     if let Some(d) = ctl.dir().map(|d| d.to_path_buf()) {
-        std::thread::Builder::new()
-            .name("picme-scan".into())
-            .spawn(move || {
-                let list = dir::list(&d);
-                let _ = scan_tx.send_blocking((d, list));
-            })
-            .expect("thread scan");
+        spawn_scan(d, scan_tx.clone());
     }
 
     if let Err(e) = gtk::init() {
@@ -468,9 +708,31 @@ fn main() {
     revealer.set_valign(gtk::Align::End);
     revealer.set_child(Some(strip.widget()));
     let osd = Osd::new();
-    // le canvas prend toute la fenetre ; la bande et l'OSD flottent par-dessus
+    // la video prend la place de l'image ; jamais sur le chemin d'un clic, d'un glisser ou d'une molette
+    let video_view = gtk::Picture::new();
+    video_view.set_content_fit(gtk::ContentFit::Contain);
+    video_view.set_hexpand(true);
+    video_view.set_vexpand(true);
+    video_view.set_can_target(false);
+    video_view.set_visible(false);
+    let live_badge = gtk::Label::new(Some("LIVE"));
+    live_badge.add_css_class("live-badge");
+    live_badge.set_halign(gtk::Align::Start);
+    live_badge.set_valign(gtk::Align::Start);
+    live_badge.set_margin_start(12);
+    live_badge.set_margin_top(52);
+    live_badge.set_can_target(false);
+    live_badge.set_visible(false);
+    let cropper = Cropper::new({
+        let canvas = canvas.clone();
+        move || canvas.image_area()
+    });
+    // le canvas prend toute la fenetre ; la video, le cadre de crop, la bande et l'OSD flottent par-dessus
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&canvas));
+    overlay.add_overlay(&video_view);
+    overlay.add_overlay(cropper.widget());
+    overlay.add_overlay(&live_badge);
     overlay.add_overlay(&revealer);
     osd.attach(&overlay);
     window.set_child(Some(&overlay));
@@ -506,8 +768,39 @@ fn main() {
         fileops: fileops.handle(),
         turned: Cell::new(0),
         delete_held: Cell::new(None),
+        cropper,
+        player: RefCell::default(),
+        video_view,
+        audio: Cell::new(false),
+        live_held: Cell::new(false),
+        live_badge,
+        scan_tx,
     });
     ui.watch_dir();
+
+    dnd::attach_source(
+        &canvas,
+        {
+            let ui = Rc::downgrade(&ui);
+            move || ui.upgrade().and_then(|ui| ui.ctl.borrow().current().map(dnd::files_of)).unwrap_or_default()
+        },
+        {
+            let ui = Rc::downgrade(&ui);
+            move |paths| {
+                if let Some(ui) = ui.upgrade() {
+                    ui.moved_away(paths);
+                }
+            }
+        },
+    );
+    dnd::attach_target(&window, {
+        let ui = Rc::downgrade(&ui);
+        move |path| {
+            if let Some(ui) = ui.upgrade() {
+                ui.open_path(&path);
+            }
+        }
+    });
 
     canvas.connect_view({
         let ui = Rc::downgrade(&ui);
@@ -564,9 +857,8 @@ fn main() {
     glib::spawn_future_local({
         let ui = Rc::downgrade(&ui);
         async move {
-            if let Ok((d, list)) = scan_rx.recv().await
-                && let Some(ui) = ui.upgrade()
-            {
+            while let Ok((d, list)) = scan_rx.recv().await {
+                let Some(ui) = ui.upgrade() else { break };
                 match list {
                     Ok(list) => {
                         let n = list.len();
@@ -621,7 +913,8 @@ fn main() {
         let ui = Rc::downgrade(&ui);
         let main_loop = main_loop.clone();
         move |_, key, code, state| {
-            let (Some(ui), Some(action)) = (ui.upgrade(), keys::action(key, state)) else { return glib::Propagation::Proceed };
+            let Some(ui) = ui.upgrade() else { return glib::Propagation::Proceed };
+            let Some(action) = keys::action(key, state, ui.ctx()) else { return glib::Propagation::Proceed };
             // Suppr maintenue : une seule fois, jusqu'au relachement
             if matches!(action, Action::Trash | Action::Delete) {
                 if ui.delete_held.get().is_some() {
@@ -635,11 +928,13 @@ fn main() {
     });
     key_ctl.connect_key_released({
         let ui = Rc::downgrade(&ui);
-        move |_, _, code, _| {
-            if let Some(ui) = ui.upgrade()
-                && ui.delete_held.get() == Some(code)
-            {
+        move |_, key, code, _| {
+            let Some(ui) = ui.upgrade() else { return };
+            if ui.delete_held.get() == Some(code) {
                 ui.delete_held.set(None);
+            }
+            if key.to_lower() == gdk::Key::l {
+                ui.live_end();
             }
         }
     });
@@ -652,6 +947,7 @@ fn main() {
                 && !w.is_active()
             {
                 ui.delete_held.set(None);
+                ui.live_end();
             }
         }
     });
@@ -701,7 +997,8 @@ fn main() {
     window.present();
     main_loop.run();
 
-    // miniatures en attente ecrites, puis sortie sans attendre les decodes en cours
+    // lecteur ferme (le fichier relache), miniatures en attente ecrites, puis sortie sans attendre les decodes en cours
+    ui.stop_player();
     drop(fileops);
     std::process::exit(0);
 }
