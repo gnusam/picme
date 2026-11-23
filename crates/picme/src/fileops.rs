@@ -19,6 +19,7 @@ use picme_core::edit::rotate::{self, Saved};
 use picme_core::error::{Error, Result};
 use picme_core::orient::Orientation;
 use picme_core::thumbs::ThumbStore;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,7 +186,14 @@ impl FileOps {
                             pending.fetch_sub(1, Ordering::AcqRel);
                         }
                         Ok(Msg::Op(op)) => {
-                            let _ = done.send_blocking(run(op, thumbs.as_ref(), &*trash));
+                            // une panique dans une operation ne doit pas tuer le thread : les suivantes (et leur
+                            // compte rendu, que le main thread attend) passeraient sous silence
+                            let failed = failure(&op);
+                            let result = catch_unwind(AssertUnwindSafe(|| run(op, thumbs.as_ref(), &*trash)));
+                            let _ = done.send_blocking(result.unwrap_or_else(|p| {
+                                let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+                                failed(Error::Io(std::io::Error::other(format!("panique : {}", msg.unwrap_or_default()))))
+                            }));
                         }
                         Ok(Msg::Stop) | Err(_) => break,
                     }
@@ -217,7 +225,27 @@ impl Drop for FileOps {
         self.stop();
     }
 }
-
+/// Le compte rendu d'echec d'une operation, a rendre avec l'erreur si elle a panique : `run` consomme l'operation, le
+/// chemin est donc retenu avant.
+fn failure(op: &Op) -> Box<dyn FnOnce(Error) -> Done> {
+    match op {
+        Op::Rotate { path, .. } => {
+            let path = path.clone();
+            Box::new(move |e| Done::Rotated { path, result: Err(e) })
+        }
+        Op::Crop { path, .. } => {
+            let path = path.clone();
+            Box::new(move |e| Done::Cropped { path, result: Err(e) })
+        }
+        Op::Trash { paths } | Op::Delete { paths } => {
+            let (paths, trash) = (paths.clone(), matches!(op, Op::Trash { .. }));
+            Box::new(move |e| {
+                let first = paths.first().cloned().unwrap_or_default();
+                Done::Removed { paths, trash, error: Some((first, e)) }
+            })
+        }
+    }
+}
 
 /// Une operation sur les fichiers, puis l'effacement des miniatures `normal` et `large` de ce qui a change.
 fn run(op: Op, thumbs: Option<&ThumbStore>, trash: &dyn Fn(&Path) -> Result<()>) -> Done {
@@ -444,5 +472,38 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), std::slice::from_ref(&e.path), "original a la corbeille avant d'etre remplace");
         assert!(!store.path_of(&e, ThumbSize::Large).exists());
         assert!(e.path.exists() && copy.exists());
+    }
+
+    #[test]
+    fn a_panicking_operation_is_reported_as_an_error_and_the_thread_survives() {
+        let tmp = TmpDir::new("fileops-panic");
+        let (tx, rx) = async_channel::unbounded();
+        // corbeille injectee : panique sur "panique.jpg", supprime le reste
+        let trash: TrashFn = Arc::new(|p: &Path| {
+            if p.ends_with("panique.jpg") {
+                panic!("corbeille en panne");
+            }
+            std::fs::remove_file(p)?;
+            Ok(())
+        });
+        let ops = FileOps::with_trash(None, tx, trash);
+        let boom = tmp.path().join("panique.jpg");
+        let mov = tmp.path().join("panique.mov");
+        std::fs::write(&boom, b"image").unwrap();
+        std::fs::write(&mov, b"video").unwrap();
+        assert!(ops.handle().trash(vec![boom.clone(), mov.clone()]));
+        let done = rx.recv_blocking().unwrap();
+        assert!(!done.ok(), "{done:?}");
+        assert!(matches!(&done, Done::Removed { trash: true, paths, error: Some((p, _)) } if *p == boom && paths.len() == 2), "{done:?}");
+        assert!(done.message().contains("corbeille en panne"), "{}", done.message());
+        assert!(boom.exists() && mov.exists());
+
+        // le thread a survecu : l'operation suivante est faite et rendue
+        let next = tmp.path().join("suivant.jpg");
+        std::fs::write(&next, b"x").unwrap();
+        assert!(ops.handle().trash(vec![next.clone()]));
+        let done = rx.recv_blocking().unwrap();
+        assert!(done.ok(), "{done:?}");
+        assert!(!next.exists());
     }
 }
