@@ -3,6 +3,7 @@
 pub mod dir;
 pub mod error;
 pub mod media;
+pub mod orient;
 
 pub use error::{Error, Result};
 
