@@ -7,6 +7,10 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+/// Taille au-dessous de laquelle un `.mov` de meme nom qu'une image est le clip de sa Live Photo (3 Mo environ chez
+/// Apple) ; au-dela, c'est une video autonome qui garde son entree.
+pub const LIVE_MOV_MAX: u64 = 15 << 20;
+
 /// Une entree de la liste : une image ou une video, avec son `.mov` de Live Photo le cas echeant.
 /// `mtime_ns` et `size` sont ceux du fichier principal ; ils entrent dans la cle de cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +41,8 @@ pub fn stat_entry(path: &Path) -> Option<Entry> {
 }
 
 /// Liste les images et videos d'un dossier (sans recursion, fichiers caches ignores), triees par nom en ordre
-/// naturel. Une image et un `.mov` de meme stem ne font qu'une entree (Live Photo) ; un `.mov` seul reste une video.
+/// naturel. Une image et un `.mov` de meme stem ne font qu'une entree (Live Photo) si l'image est la seule de ce stem
+/// et le `.mov` petit (`LIVE_MOV_MAX`) ; sinon le `.mov` reste une video.
 pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for item in std::fs::read_dir(dir)? {
@@ -74,10 +79,22 @@ pub struct Reconciled {
 
 /// Remet la liste (issue de `list` sur le dossier de `path`) en accord avec l'etat disque de `path`, par un seul stat.
 /// Idempotent : un second appel sans changement sur le disque ne fait rien. Memes regles que `list` : fichiers
-/// caches ignores, un `.mov` rejoint l'image de meme stem (Live Photo), et redevient une video seule si l'image part.
+/// caches ignores, un `.mov` rejoint l'image de meme stem (Live Photo, aux conditions de `list`), et redevient une
+/// video seule si l'image part, si une seconde image du meme stem arrive ou si le `.mov` grossit.
 pub fn reconcile(entries: &mut Vec<Entry>, path: &Path) -> Reconciled {
     let mut out = Reconciled::default();
     let now = stat_entry(path);
+    if path.file_name().is_none_or(|n| n.as_encoded_bytes().starts_with(b".")) {
+        return out;
+    }
+    let stem = stem_key(path);
+    reconcile_path(entries, path, now, &mut out);
+    restitch(entries, &stem, &mut out);
+    out
+}
+
+/// L'etat de `path` seul : insertion, mise a jour ou retrait de son entree, sans regarder les appariements du stem.
+fn reconcile_path(entries: &mut Vec<Entry>, path: &Path, now: Option<Entry>, out: &mut Reconciled) {
     if let Some(i) = entries.iter().position(|e| e.path == path) {
         match now {
             None => {
@@ -97,38 +114,53 @@ pub fn reconcile(entries: &mut Vec<Entry>, path: &Path) -> Reconciled {
             }
             Some(_) => {}
         }
-        return out;
+        return;
     }
     if let Some(i) = entries.iter().position(|e| e.live_mov.as_deref() == Some(path)) {
-        // le .mov d'une Live Photo : seule sa disparition change la liste
-        if now.is_none() {
-            entries[i].live_mov = None;
+        // le .mov d'une Live Photo : sa disparition change la liste, et sa croissance au-dela d'un clip de Live Photo
+        // en refait une video seule
+        match now {
+            Some(mov) if is_live_mov(&mov) => {}
+            other => {
+                entries[i].live_mov = None;
+                if let Some(mov) = other {
+                    insert_sorted(entries, mov);
+                }
+                out.changed = true;
+            }
+        }
+        return;
+    }
+    if let Some(new) = now {
+        insert_sorted(entries, new);
+        out.changed = true;
+    }
+}
+
+/// Remet les appariements Live Photo du `stem` en accord avec `list` : un `.mov` n'est rattache qu'a l'unique image
+/// de ce stem, et se detache si une seconde image arrive ; il redevient une entree a part entiere. A l'inverse, la
+/// video seule est absorbee quand l'image devient unique (arrivee de l'image, depart de sa jumelle).
+fn restitch(entries: &mut Vec<Entry>, stem: &str, out: &mut Reconciled) {
+    let images: Vec<usize> = (0..entries.len()).filter(|&i| entries[i].kind != MediaKind::Video && stem_key(&entries[i].path) == stem).collect();
+    if let [img] = images[..] {
+        if entries[img].live_mov.is_some() {
+            return;
+        }
+        if let Some(j) = entries.iter().position(|e| is_live_mov(e) && stem_key(&e.path) == stem) {
+            // la video seule devient la partie animee de la Live Photo
+            let mov = entries.remove(j);
+            let img = if j < img { img - 1 } else { img };
+            entries[img].live_mov = Some(mov.path.clone());
+            out.removed.push((j, mov));
             out.changed = true;
         }
-        return out;
+        return;
     }
-    let Some(mut new) = now else { return out };
-    if path.file_name().is_none_or(|n| n.as_encoded_bytes().starts_with(b".")) {
-        return out;
+    let detached: Vec<PathBuf> = images.into_iter().filter_map(|i| entries[i].live_mov.take()).collect();
+    out.changed |= !detached.is_empty();
+    for mov in detached.iter().filter_map(|p| stat_entry(p)) {
+        insert_sorted(entries, mov);
     }
-    let stem = stem_key(path);
-    if is_mov(&new) && new.kind == MediaKind::Video {
-        if let Some(img) = entries.iter_mut().find(|e| e.kind != MediaKind::Video && e.live_mov.is_none() && stem_key(&e.path) == stem) {
-            img.live_mov = Some(new.path);
-            out.changed = true;
-            return out;
-        }
-    } else if new.kind != MediaKind::Video
-        && let Some(j) = entries.iter().position(|e| is_mov(e) && e.kind == MediaKind::Video && stem_key(&e.path) == stem)
-    {
-        // l'image arrive apres son .mov : la video seule devient la partie animee de la Live Photo
-        let mov = entries.remove(j);
-        new.live_mov = Some(mov.path.clone());
-        out.removed.push((j, mov));
-    }
-    insert_sorted(entries, new);
-    out.changed = true;
-    out
 }
 
 fn file_name(p: &Path) -> String {
@@ -143,21 +175,29 @@ fn is_mov(e: &Entry) -> bool {
     e.path.extension().is_some_and(|x| x.eq_ignore_ascii_case("mov"))
 }
 
-/// `entries` est deja trie. Un `.mov` est rattache a la premiere image (hors video) de meme stem, casse ignoree
-/// (IMG_0001.HEIC et IMG_0001.MOV chez Apple) ; l'ordre de la liste reste celui des images.
+/// Un `.mov` assez petit pour etre le clip d'une Live Photo (quelques secondes, moins de `LIVE_MOV_MAX`) ; un plus
+/// gros est une video autonome.
+fn is_live_mov(e: &Entry) -> bool {
+    is_mov(e) && e.kind == MediaKind::Video && e.size < LIVE_MOV_MAX
+}
+
+/// `entries` est deja trie. Un `.mov` de taille Live Photo est rattache a l'image (hors video) de meme stem, casse
+/// ignoree (IMG_0001.HEIC et IMG_0001.MOV chez Apple), si elle est la seule de ce stem : avec IMG_0001.HEIC et
+/// IMG_0001.jpg l'appartenance est incertaine, et rattacher le `.mov` le ferait partir avec la mauvaise image a la
+/// suppression. L'ordre de la liste reste celui des images.
 fn pair_live_photos(entries: Vec<Entry>) -> Vec<Entry> {
-    let mut image_of_stem: HashMap<String, usize> = HashMap::new();
+    // (index de l'image, nombre d'images) par stem
+    let mut image_of_stem: HashMap<String, (usize, usize)> = HashMap::new();
     for (i, e) in entries.iter().enumerate() {
         if e.kind != MediaKind::Video {
-            image_of_stem.entry(stem_key(&e.path)).or_insert(i);
+            image_of_stem.entry(stem_key(&e.path)).or_insert((i, 0)).1 += 1;
         }
     }
     let mut live: HashMap<usize, PathBuf> = HashMap::new();
     let mut paired = vec![false; entries.len()];
     for (i, e) in entries.iter().enumerate() {
-        if is_mov(e)
-            && e.kind == MediaKind::Video
-            && let Some(&img) = image_of_stem.get(&stem_key(&e.path))
+        if is_live_mov(e)
+            && let Some(&(img, 1)) = image_of_stem.get(&stem_key(&e.path))
         {
             live.entry(img).or_insert_with(|| e.path.clone());
             paired[i] = live[&img] == e.path;
@@ -359,6 +399,69 @@ mod tests {
         assert_eq!(r.removed.len(), 1, "la video seule quitte la liste");
         assert_eq!(names(&v), ["IMG_1.HEIC"]);
         assert_eq!(v, list(dir.path()).unwrap(), "meme resultat qu'un nouveau listing");
+    }
+
+    #[test]
+    fn a_mov_is_paired_only_with_a_unique_image_and_below_the_live_photo_size() {
+        let dir = TmpDir::new("dir-live-rules");
+        let p = |n: &str| dir.path().join(n);
+        for name in ["IMG_1.HEIC", "IMG_1.jpg", "IMG_1.MOV", "vacances.jpg", "vacances.mov", "ok.jpg", "ok.mov"] {
+            std::fs::write(p(name), b"x").unwrap();
+        }
+        // un clip au-dela du seuil : une video autonome, meme avec une image unique de meme nom
+        std::fs::File::options().write(true).open(p("vacances.mov")).unwrap().set_len(LIVE_MOV_MAX).unwrap();
+
+        let list = list(dir.path()).unwrap();
+        assert_eq!(names(&list), ["IMG_1.HEIC", "IMG_1.jpg", "IMG_1.MOV", "ok.jpg", "vacances.jpg", "vacances.mov"]);
+        let by_name = |n: &str| list.iter().find(|e| file_name(&e.path) == n).unwrap();
+        for n in ["IMG_1.HEIC", "IMG_1.jpg", "IMG_1.MOV", "vacances.jpg", "vacances.mov"] {
+            assert_eq!(by_name(n).live_mov, None, "{n}");
+        }
+        assert_eq!(by_name("IMG_1.MOV").kind, MediaKind::Video);
+        assert_eq!(by_name("ok.jpg").live_mov.as_deref(), Some(p("ok.mov").as_path()));
+
+        // juste au-dessous du seuil : apparie
+        std::fs::File::options().write(true).open(p("vacances.mov")).unwrap().set_len(LIVE_MOV_MAX - 1).unwrap();
+        let list = super::list(dir.path()).unwrap();
+        assert_eq!(names(&list), ["IMG_1.HEIC", "IMG_1.jpg", "IMG_1.MOV", "ok.jpg", "vacances.jpg"]);
+    }
+
+    #[test]
+    fn reconcile_unpairs_and_repairs_like_list() {
+        let dir = TmpDir::new("dir-reconcile-rules");
+        let p = |n: &str| dir.path().join(n);
+        std::fs::write(p("IMG_1.HEIC"), b"x").unwrap();
+        std::fs::write(p("IMG_1.MOV"), b"x").unwrap();
+        let mut v = list(dir.path()).unwrap();
+        assert_eq!((names(&v), v[0].live_mov.is_some()), (vec!["IMG_1.HEIC".to_string()], true));
+
+        // une seconde image du meme nom : l'appartenance du .mov devient incertaine, il redevient une video
+        std::fs::write(p("IMG_1.jpg"), b"x").unwrap();
+        assert!(reconcile(&mut v, &p("IMG_1.jpg")).changed);
+        assert_eq!(names(&v), ["IMG_1.HEIC", "IMG_1.jpg", "IMG_1.MOV"]);
+        assert!(v.iter().all(|e| e.live_mov.is_none()));
+        assert_eq!(v, list(dir.path()).unwrap());
+        assert_eq!(reconcile(&mut v, &p("IMG_1.jpg")), Reconciled::default());
+
+        // la jumelle part : l'image restante redevient unique et absorbe le .mov
+        std::fs::remove_file(p("IMG_1.jpg")).unwrap();
+        let r = reconcile(&mut v, &p("IMG_1.jpg"));
+        assert!(r.changed);
+        assert_eq!(names(&v), ["IMG_1.HEIC"]);
+        assert_eq!(v, list(dir.path()).unwrap());
+
+        // le .mov grossit au-dela d'un clip de Live Photo : video autonome
+        std::fs::File::options().write(true).open(p("IMG_1.MOV")).unwrap().set_len(LIVE_MOV_MAX).unwrap();
+        assert!(reconcile(&mut v, &p("IMG_1.MOV")).changed);
+        assert_eq!(names(&v), ["IMG_1.HEIC", "IMG_1.MOV"]);
+        assert_eq!(v, list(dir.path()).unwrap());
+        assert_eq!(reconcile(&mut v, &p("IMG_1.MOV")), Reconciled::default());
+
+        // et se rattache de nouveau en redevenant petit
+        std::fs::File::options().write(true).open(p("IMG_1.MOV")).unwrap().set_len(5).unwrap();
+        assert!(reconcile(&mut v, &p("IMG_1.MOV")).changed);
+        assert_eq!(names(&v), ["IMG_1.HEIC"]);
+        assert_eq!(v, list(dir.path()).unwrap());
     }
 
     #[test]

@@ -41,6 +41,7 @@ flowchart TB
 `picme <fichier>` ouvre le fichier et son dossier devient la liste de navigation, triée par nom. Le bandeau de miniatures (filmstrip) suit l'image courante.
 
 - Une Live Photo (image HEIC ou JPEG avec le `.mov` du même nom) s'affiche comme une image avec un petit repère `LIVE` ; le `.mov` joue tant que L est tenue.
+- Le `.mov` n'est apparié que si une seule image porte ce nom de base (IMG_0001.HEIC avec IMG_0001.jpg : pas d'appariement) et s'il pèse moins de 15 Mio ; sinon il reste une vidéo à part entière, avec sa propre entrée, et Suppr sur l'image ne touche pas à lui. Un apparié part à la corbeille avec son image.
 - Une vidéo démarre à l'ouverture, sans son. M active le son ; si la sortie audio manque, le son se coupe de nouveau et un message le dit.
 - Une touche tenue répète : Droite tenue fait défiler les images, Suppr tenue ne supprime qu'un fichier.
 

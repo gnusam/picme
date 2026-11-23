@@ -1227,6 +1227,20 @@ mod tests {
     }
 
     #[test]
+    fn removing_an_image_never_takes_a_standalone_video_of_the_same_name() {
+        let mut r = rig("ctl-remove-not-live", 2, 0, 256 << 20);
+        let (img, mov) = (r.dir.path().join("i00.jpg"), r.dir.path().join("i00.mov"));
+        // un clip trop gros pour une Live Photo : video autonome, visible dans la navigation
+        std::fs::write(&mov, b"x").unwrap();
+        std::fs::File::options().write(true).open(&mov).unwrap().set_len(dir::LIVE_MOV_MAX).unwrap();
+        r.c.set_entries(r.dir.path(), dir::list(r.dir.path()).unwrap());
+        assert_eq!(r.c.entries().len(), 3);
+        let (paths, _) = r.c.remove_current().unwrap();
+        assert_eq!(paths, vec![img]);
+        assert!(r.c.entries().iter().any(|e| e.path == mov));
+    }
+
+    #[test]
     fn a_turn_that_cannot_be_saved_stays_in_the_view_for_the_session() {
         let mut r = rig("ctl-turn-view", 2, 0, 256 << 20);
         let p0 = r.dir.path().join("i00.jpg");
