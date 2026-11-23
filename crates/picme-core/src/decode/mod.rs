@@ -27,6 +27,21 @@ pub const STRIP_H: u32 = 96;
 /// Budget RAM par defaut du cache de textures (`--cache-mb`, 256 Mo). `Full` est reduit au-dela de la moitie.
 pub const DEFAULT_BUDGET_BYTES: usize = 256 << 20;
 
+/// Plafond de pixels (largeur x hauteur) d'une image que les decodeurs sans reduction a la source (HEIF, JPEG XL)
+/// acceptent : 200 Mpx, soit 800 Mo en RGBA. Au-dela, l'image est refusee avant toute allocation.
+pub const MAX_PIXELS: u64 = 200_000_000;
+
+/// Plafond en octets RGBA du decode d'une image entiere pour l'edition (`MAX_PIXELS` pixels).
+pub const MAX_PIXELS_BYTES: usize = MAX_PIXELS as usize * 4;
+
+/// Refuse une image de plus de `MAX_PIXELS` pixels, a appeler sur les dimensions de l'en-tete avant d'allouer.
+pub(crate) fn check_dims(w: u32, h: u32) -> Result<()> {
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err(Error::Decode(format!("image de {w}x{h} pixels : au-dela du plafond de {} Mpx", MAX_PIXELS / 1_000_000)));
+    }
+    Ok(())
+}
+
 /// Taille voulue. Dans tous les cas l'image garde ses proportions et n'est jamais agrandie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
@@ -427,6 +442,64 @@ mod tests {
         // erreur fatale : refusee meme pour l'affichage
         std::fs::write(&p, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]).unwrap();
         assert!(decode_display(&p, Target::Full, usize::MAX).is_err());
+    }
+
+    /// Code stream JPEG XL reduit a son en-tete : signature, SizeHeader de `w` x `h`, metadonnees par defaut.
+    fn jxl_header(w: u32, h: u32) -> Vec<u8> {
+        let (mut bits, mut n) = (0u128, 0u32);
+        let mut put = |v: u64, len: u32| {
+            bits |= u128::from(v) << n;
+            n += len;
+        };
+        put(0, 1); // div8
+        put(3, 2); // ysize : 30 bits + 1
+        put(u64::from(h - 1), 30);
+        put(0, 3); // ratio 0 : xsize explicite
+        put(3, 2);
+        put(u64::from(w - 1), 30);
+        put(1, 1); // ImageMetadata all_default
+        put(1, 1); // default_m : matrice opsin par defaut
+        let mut out = vec![0xFF, 0x0A];
+        out.extend_from_slice(&bits.to_le_bytes()[..n.div_ceil(8) as usize]);
+        out.extend_from_slice(&[0; 16]); // debut d'un frame, que le decodeur ne lira pas
+        out
+    }
+
+    /// `g.heic` dont les boites `ispe` annoncent `w` x `h`.
+    fn heic_claiming(w: u32, h: u32) -> Vec<u8> {
+        let mut data = std::fs::read(fx("g.heic")).unwrap();
+        let mut found = 0;
+        for at in (0..data.len() - 16).filter(|&i| &data[i..i + 4] == b"ispe").collect::<Vec<_>>() {
+            data[at + 8..at + 12].copy_from_slice(&w.to_be_bytes());
+            data[at + 12..at + 16].copy_from_slice(&h.to_be_bytes());
+            found += 1;
+        }
+        assert!(found > 0);
+        data
+    }
+
+    #[test]
+    fn huge_headers_are_refused_before_any_allocation() {
+        let dir = crate::testutil::TmpDir::new("decode-huge");
+        let msg = |r: Result<Frame>| match r {
+            Err(Error::Decode(m)) => m,
+            other => panic!("{:?}", other.map(|f| (f.w, f.h))),
+        };
+        // 20000 x 20000 : 400 Mpx, rien n'est alloue (le fichier ne fait que quelques octets de donnees)
+        let jxl = dir.path().join("huge.jxl");
+        std::fs::write(&jxl, jxl_header(20000, 20000)).unwrap();
+        for target in [Target::Preview, Target::Full] {
+            let m = msg(decode(&jxl, target));
+            assert!(m.contains("plafond"), "jxl {target:?} : {m}");
+        }
+        let heic = dir.path().join("huge.heic");
+        std::fs::write(&heic, heic_claiming(20000, 20000)).unwrap();
+        for target in [Target::Preview, Target::Full] {
+            assert!(msg(decode(&heic, target)).contains("plafond"), "heic {target:?}");
+        }
+        // pile au plafond : accepte par check_dims (le decodage echoue ensuite sur le flux, pas sur les dimensions)
+        assert!(check_dims(20000, 10000).is_ok() && check_dims(20000, 10001).is_err());
+        assert!(check_dims(u32::MAX, u32::MAX).is_err());
     }
 
     #[test]

@@ -134,7 +134,11 @@ fn crop_tiff(data: &[u8], rect: Frac) -> Result<Out> {
 /// Formats que picme ne sait pas ecrire : decodage complet (orientation appliquee), crop, JPEG qualite 92.
 /// La transparence est perdue (JPEG).
 fn crop_reencoded(path: &Path, rect: Frac) -> Result<Out> {
-    let frame = decode::decode_capped(path, Target::Full, usize::MAX)?;
+    let frame = decode::decode_capped(path, Target::Full, decode::MAX_PIXELS_BYTES)?;
+    // sous le plafond de pixels, `Full` n'est jamais reduit : une reduction ecrirait un crop de moindre definition
+    if (frame.w, frame.h) != (frame.full_w, frame.full_h) {
+        return Err(Error::Invalid(format!("image de {}x{} trop grande pour un crop re-encode", frame.full_w, frame.full_h)));
+    }
     let r = to_pixels(rect, frame.w, frame.h)?;
     let line = frame.w as usize * 4;
     let mut rgba = Vec::with_capacity(r.w as usize * r.h as usize * 4);
@@ -234,6 +238,21 @@ mod tests {
         assert_eq!(to_pixels(HALF, 640, 480).unwrap(), Rect { x: 160, y: 120, w: 320, h: 240 });
         assert_eq!(to_pixels(Frac { x: 0.9999, y: 0.0, w: 0.5, h: 1.0 }, 10, 10).unwrap(), Rect { x: 9, y: 0, w: 1, h: 10 });
         assert!(to_pixels(Frac { x: 0.1, y: 0.1, w: 0.0, h: 0.5 }, 10, 10).is_err());
+    }
+
+    #[test]
+    fn a_reencoded_crop_refuses_an_image_above_the_pixel_ceiling() {
+        let tmp = TmpDir::new("crop-huge");
+        let p = tmp.path().join("huge.heic");
+        let mut data = fs::read(fixtures_dir().join("g.heic")).unwrap();
+        for at in (0..data.len() - 16).filter(|&i| &data[i..i + 4] == b"ispe").collect::<Vec<_>>() {
+            data[at + 8..at + 16].copy_from_slice(&[0, 0, 0x4E, 0x20, 0, 0, 0x4E, 0x20]); // 20000 x 20000
+        }
+        fs::write(&p, &data).unwrap();
+        let err = crop(&p, HALF, None).unwrap_err();
+        assert!(matches!(&err, Error::Decode(m) if m.contains("plafond")), "{err}");
+        assert_eq!(fs::read(&p).unwrap(), data);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1, "ni copie ni temporaire");
     }
 
     #[test]

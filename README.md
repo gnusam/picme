@@ -82,6 +82,7 @@ Vers picme : déposer un fichier sur la fenêtre l'ouvre et son dossier devient 
 ## Limites
 
 - Un JPEG tronqué ou aux données corrompues s'affiche tel que libjpeg le lit (la partie manquante est grise) ; il n'est ni tourné ni recadré, aucune miniature n'en est écrite.
+- Une image HEIC, AVIF ou JPEG XL de plus de 200 Mpx est refusée avant toute allocation, avec un message d'erreur qui le dit ; le recadrage avec ré-encodage applique le même plafond.
 
 ## Compilation
 

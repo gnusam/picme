@@ -1,6 +1,6 @@
 //! HEIC et AVIF par libheif. libheif applique lui-meme irot, imir et clap : l'orientation EXIF n'est pas relue.
 
-use super::{Frame, Plan, Target, ratio_matches};
+use super::{Frame, Plan, Target, check_dims, ratio_matches};
 use crate::error::{Error, Result};
 use crate::orient::Orientation;
 use libheif_rs::{ColorSpace, DecodingOptions, HeifContext, ImageHandle, ItemId, LibHeif, RgbChroma};
@@ -18,6 +18,7 @@ pub(super) fn decode(path: &Path, target: Target, max_full_bytes: usize) -> Resu
     let ctx = HeifContext::read_from_bytes(&data).map_err(Error::decode)?;
     let handle = ctx.primary_image_handle().map_err(Error::decode)?;
     let (full_w, full_h) = (handle.width(), handle.height());
+    check_dims(full_w, full_h)?;
 
     if target == Target::Preview
         && let Some((rgba, w, h, has_alpha)) = embedded_thumbnail(&handle)
@@ -55,15 +56,24 @@ fn embedded_thumbnail(handle: &ImageHandle) -> Option<(Vec<u8>, u32, u32, bool)>
 
 /// Decode en RGBA 8 bits (les 10 bits sont ramenes a 8). Rend le buffer, ses dimensions et la presence d'alpha.
 fn decode_handle(handle: &ImageHandle) -> Result<(Vec<u8>, u32, u32, bool)> {
+    check_dims(handle.width(), handle.height())?;
     let mut options = DecodingOptions::new().ok_or_else(|| Error::Decode("libheif : options de decode".into()))?;
     options.set_convert_hdr_to_8bit(true);
     let image = lib().decode(handle, ColorSpace::Rgb(RgbChroma::Rgba), Some(options)).map_err(Error::decode)?;
     let plane = image.planes().interleaved.ok_or_else(|| Error::Decode("libheif : pas de plan RGBA".into()))?;
     let (w, h) = (plane.width, plane.height);
-    let row = w as usize * 4;
-    let mut rgba = Vec::with_capacity(row * h as usize);
-    for y in 0..h as usize {
-        rgba.extend_from_slice(&plane.data[y * plane.stride..y * plane.stride + row]);
-    }
+    let (row, h) = (w as usize * 4, h as usize);
+    let rgba = if plane.stride == row {
+        // plan contigu : une seule copie, sans parcourir les lignes
+        plane.data.get(..row * h).ok_or_else(|| Error::Decode("libheif : plan RGBA trop court".into()))?.to_vec()
+    } else {
+        let mut rgba = Vec::with_capacity(row * h);
+        for y in 0..h {
+            let line = plane.data.get(y * plane.stride..y * plane.stride + row).ok_or_else(|| Error::Decode("libheif : plan RGBA trop court".into()))?;
+            rgba.extend_from_slice(line);
+        }
+        rgba
+    };
+    let h = h as u32;
     Ok((rgba, w, h, handle.has_alpha_channel()))
 }
