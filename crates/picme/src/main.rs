@@ -62,6 +62,8 @@ struct Ui {
     trace: Trace,
     bench: RefCell<Option<Bench>>,
     painted_image: Cell<bool>,
+    /// Fin de repetition programmee (`Controller::settle`).
+    settle: RefCell<Option<glib::SourceId>>,
 }
 
 impl Ui {
@@ -98,13 +100,37 @@ impl Ui {
         self.apply(show);
     }
 
-    fn go(&self, delta: isize) {
+    fn go(self: &Rc<Self>, delta: isize) {
+        let from = self.ctl.borrow().index();
         let show = self.ctl.borrow_mut().go(delta);
         self.apply(show);
+        // touche maintenue : les Fit attendent REPEAT_GAP sans navigation (touche tenue en bout de dossier : pas de
+        // navigation, le timeout deja arme n'est pas repousse)
+        let rearm = self.ctl.borrow().repeating() && self.ctl.borrow().index() != from;
+        if rearm {
+            self.schedule_settle(app::REPEAT_GAP);
+        }
+    }
+
+    fn schedule_settle(self: &Rc<Self>, after: Duration) {
+        if let Some(id) = self.settle.borrow_mut().take() {
+            id.remove();
+        }
+        let ui = Rc::downgrade(self);
+        *self.settle.borrow_mut() = Some(glib::timeout_add_local_once(after, move || {
+            let Some(ui) = ui.upgrade() else { return };
+            ui.settle.borrow_mut().take();
+            let show = ui.ctl.borrow_mut().settle();
+            ui.apply(show);
+            // timeout servi un peu avant REPEAT_GAP apres la derniere navigation : on repasse
+            if ui.ctl.borrow().repeating() {
+                ui.schedule_settle(Duration::from_millis(5));
+            }
+        }));
     }
 
     /// Un tick du banc de navigation. Faux quand il est fini.
-    fn bench_tick(&self, due: Instant) -> bool {
+    fn bench_tick(self: &Rc<Self>, due: Instant) -> bool {
         let mut done = false;
         if let Some(b) = self.bench.borrow_mut().as_mut() {
             b.late = b.late.max(Instant::now().saturating_duration_since(due));
@@ -267,6 +293,7 @@ fn main() {
         trace,
         bench: RefCell::new(bench),
         painted_image: Cell::new(false),
+        settle: RefCell::default(),
     });
 
     // resultats deja prets (le Preview, souvent) : dans le premier frame
