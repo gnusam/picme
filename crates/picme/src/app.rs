@@ -188,6 +188,14 @@ pub struct Controller<T> {
     decode: Box<dyn Jobs>,
     thumbs: Box<dyn Jobs>,
     make: Box<dyn Fn(Frame) -> T>,
+    /// Fichiers en cours de suppression (Suppr) : deja retires de la liste, ignores par `reconcile` et les scans
+    /// jusqu'a `removal_done`.
+    removing: HashSet<PathBuf>,
+    /// Rotations R par fichier, dans l'ordre d'envoi au thread d'ecriture : quarts de tour, et identite du fichier
+    /// une fois ecrit (`None` tant qu'il ne l'est pas). Oubliees quand l'image affichee les contient.
+    turns: HashMap<PathBuf, Vec<(i32, Option<Ident>)>>,
+    /// Rotations R que le format ne permet pas d'enregistrer : vue seule, pour la session.
+    view_turns: HashMap<PathBuf, i32>,
 }
 
 impl<T: Clone> Controller<T> {
@@ -213,6 +221,9 @@ impl<T: Clone> Controller<T> {
             decode,
             thumbs,
             make,
+            removing: HashSet::new(),
+            turns: HashMap::new(),
+            view_turns: HashMap::new(),
         }
     }
 
@@ -272,6 +283,7 @@ impl<T: Clone> Controller<T> {
             return Show::Keep;
         }
         self.entries = entries;
+        self.entries.retain(|e| !self.removing.contains(&e.path));
         self.rev += 1;
         if let Some(cur) = self.current.clone()
             && !self.entries.iter().any(|e| e.path == cur)
@@ -342,7 +354,7 @@ impl<T: Clone> Controller<T> {
 
     /// Re-stat de `path` apres un evenement du dossier (ou une operation de picme). Idempotent.
     pub fn reconcile(&mut self, path: &Path) -> Show<T> {
-        if self.dir.is_none() || path.parent() != self.dir.as_deref() {
+        if self.dir.is_none() || path.parent() != self.dir.as_deref() || self.removing.contains(path) {
             return Show::Keep;
         }
         let before = self.index();
@@ -367,6 +379,75 @@ impl<T: Clone> Controller<T> {
             self.set_current(next);
         }
         self.refresh()
+    }
+
+    /// Suppr : retire le courant de la liste tout de suite, la suivante devient courante (la precedente en fin de
+    /// liste). Rend les fichiers a retirer du disque, l'image puis le `.mov` d'une Live Photo.
+    pub fn remove_current(&mut self) -> Option<(Vec<PathBuf>, Show<T>)> {
+        let i = self.index()?;
+        let e = self.entries.remove(i);
+        self.rev += 1;
+        self.forget(&Ident::of(&e));
+        self.turns.remove(&e.path);
+        self.view_turns.remove(&e.path);
+        let paths: Vec<PathBuf> = std::iter::once(e.path).chain(e.live_mov).collect();
+        self.removing.extend(paths.iter().cloned());
+        let next = self.entries.get(i.min(self.entries.len().saturating_sub(1))).map(|e| e.path.clone());
+        self.set_current(next);
+        Some((paths, self.refresh()))
+    }
+
+    /// Fin de la suppression de `path`, reussie ou non : un fichier encore sur le disque revient dans la liste.
+    pub fn removal_done(&mut self, path: &Path) -> Show<T> {
+        self.removing.remove(path);
+        self.reconcile(path)
+    }
+
+    /// R : `quarters` quarts de tour du courant, que l'appelant envoie au thread d'ecriture ; la vue tourne tout de
+    /// suite (`view_quarters`). Rend le chemin a tourner, `None` si le courant n'est pas une image.
+    pub fn turn(&mut self, quarters: i32) -> Option<PathBuf> {
+        let path = self.current().filter(|e| decodable(e.kind))?.path.clone();
+        self.turns.entry(path.clone()).or_default().push((quarters, None));
+        Some(path)
+    }
+
+    /// Fin de la plus ancienne rotation en cours sur `path`. `saved` : le fichier est reecrit, la liste suit ; sinon
+    /// la rotation reste celle de la vue, pour la session.
+    pub fn turn_done(&mut self, path: &Path, saved: bool) -> Show<T> {
+        let show = if saved { self.reconcile(path) } else { Show::Keep };
+        let written = self.entries.iter().find(|e| e.path == path).map(Ident::of);
+        if let Some(list) = self.turns.get_mut(path)
+            && let Some(i) = list.iter().position(|(_, w)| w.is_none())
+        {
+            match written {
+                Some(id) if saved => list[i].1 = Some(id),
+                Some(_) => *self.view_turns.entry(path.to_path_buf()).or_default() += list.remove(i).0,
+                // fichier sorti de la liste
+                None => drop(list.remove(i)),
+            }
+            if list.is_empty() {
+                self.turns.remove(path);
+            }
+        }
+        show
+    }
+
+    /// Quarts de tour que la vue ajoute a l'image affichee du courant : rotations de vue seule, et rotations R pas
+    /// encore dans l'image affichee (en cours, ou ecrites dans une version plus recente). Celles qu'elle contient
+    /// sont oubliees.
+    pub fn view_quarters(&mut self) -> i32 {
+        let Some(path) = self.current.clone() else { return 0 };
+        let shown = self.shown.as_ref().map(|(id, _, _)| id).filter(|id| id.path == path);
+        let mut q = self.view_turns.get(&path).copied().unwrap_or(0);
+        if let Some(list) = self.turns.get_mut(&path) {
+            // l'ecriture atomique garantit un mtime croissant : la version ecrite, ou une plus recente, contient la rotation
+            list.retain(|(_, w)| !matches!((w, shown), (Some(w), Some(s)) if s == w || s.mtime_ns > w.mtime_ns));
+            q += list.iter().map(|(n, _)| n).sum::<i32>();
+            if list.is_empty() {
+                self.turns.remove(&path);
+            }
+        }
+        q
     }
 
     /// Resultat d'un pool.
@@ -1088,6 +1169,116 @@ mod tests {
     }
 
     #[test]
+    fn remove_moves_to_the_next_and_ignores_the_file_until_its_removal_is_done() {
+        let mut r = rig("ctl-remove", 4, 1, 256 << 20);
+        r.c.set_viewport(800, 600);
+        let p1 = r.dir.path().join("i01.jpg");
+        let rev = r.c.rev();
+        let (paths, _) = r.c.remove_current().unwrap();
+        assert_eq!(paths, vec![p1.clone()]);
+        assert_eq!(name(&r.c), "i02.jpg");
+        assert_eq!((r.c.entries().len(), r.c.rev()), (3, rev + 1));
+        assert!(r.decode.jobs().iter().all(|j| j.0 != "i01.jpg"));
+        // encore sur le disque pendant la suppression : ni l'evenement du dossier ni un scan ne le remettent
+        assert!(matches!(r.c.reconcile(&p1), Show::Keep));
+        r.c.set_entries(r.dir.path(), dir::list(r.dir.path()).unwrap());
+        assert_eq!(r.c.entries().len(), 3);
+        std::fs::remove_file(&p1).unwrap();
+        r.c.removal_done(&p1);
+        assert_eq!((r.c.entries().len(), name(&r.c)), (3, "i02.jpg".to_string()));
+
+        // echec : le fichier toujours la revient dans la liste, le courant ne bouge pas
+        r.c.remove_current().unwrap();
+        assert_eq!(name(&r.c), "i03.jpg");
+        r.c.removal_done(&r.dir.path().join("i02.jpg"));
+        assert_eq!((r.c.entries().len(), name(&r.c)), (3, "i03.jpg".to_string()));
+
+        // en fin de liste : la precedente ; liste videe : plus de courant
+        r.c.remove_current().unwrap();
+        assert_eq!(name(&r.c), "i02.jpg");
+        r.c.remove_current().unwrap();
+        r.c.remove_current().unwrap();
+        assert!(r.c.current().is_none() && r.c.remove_current().is_none());
+    }
+
+    #[test]
+    fn removing_a_live_photo_takes_its_mov_and_a_mov_left_behind_comes_back_alone() {
+        let mut r = rig("ctl-remove-live", 2, 0, 256 << 20);
+        let (img, mov) = (r.dir.path().join("i00.jpg"), r.dir.path().join("i00.mov"));
+        std::fs::write(&mov, b"x").unwrap();
+        r.c.set_entries(r.dir.path(), dir::list(r.dir.path()).unwrap());
+        assert_eq!(r.c.entries().len(), 2);
+        let (paths, _) = r.c.remove_current().unwrap();
+        assert_eq!(paths, vec![img.clone(), mov.clone()]);
+        assert_eq!(name(&r.c), "i01.jpg");
+        assert!(matches!(r.c.reconcile(&mov), Show::Keep));
+        // l'image partie, le .mov refuse : il redevient une entree
+        std::fs::remove_file(&img).unwrap();
+        r.c.removal_done(&img);
+        r.c.removal_done(&mov);
+        let names: Vec<_> = r.c.entries().iter().map(|e| e.path.file_name().unwrap().to_owned()).collect();
+        assert_eq!(names, ["i00.mov", "i01.jpg"]);
+        assert_eq!(name(&r.c), "i01.jpg");
+    }
+
+    #[test]
+    fn a_turn_that_cannot_be_saved_stays_in_the_view_for_the_session() {
+        let mut r = rig("ctl-turn-view", 2, 0, 256 << 20);
+        let p0 = r.dir.path().join("i00.jpg");
+        assert_eq!(r.c.turn(1), Some(p0.clone()));
+        assert_eq!(r.c.turn(1), Some(p0.clone()));
+        assert_eq!(r.c.view_quarters(), 2, "la vue tourne avant la fin de l'ecriture");
+        r.c.turn_done(&p0, false);
+        assert_eq!(r.c.view_quarters(), 2);
+        r.c.turn_done(&p0, false);
+        assert_eq!(r.c.view_quarters(), 2);
+        r.c.go(1);
+        assert_eq!(r.c.view_quarters(), 0);
+        r.c.go(-1);
+        assert_eq!(r.c.view_quarters(), 2, "retenue pour la session");
+        // une video ne tourne pas
+        std::fs::write(r.dir.path().join("v.mov"), b"x").unwrap();
+        r.c.open(&r.dir.path().join("v.mov"));
+        assert_eq!(r.c.turn(1), None);
+    }
+
+    #[test]
+    fn a_saved_turn_leaves_the_view_only_once_the_rewritten_file_is_shown() {
+        let mut r = rig("ctl-turn-saved", 2, 0, 256 << 20);
+        r.c.set_viewport(800, 600);
+        let old = r.decode.take("i00.jpg", Level::Fit);
+        shown(r.c.on_result(old, Ok(frame(800, 600))));
+        let p0 = r.dir.path().join("i00.jpg");
+        r.c.turn(1);
+        r.c.turn(-1);
+        r.c.turn(1);
+        assert_eq!(r.c.view_quarters(), 1);
+        // le thread d'ecriture : fichier reecrit, mtime plus recent (comme l'ecriture atomique)
+        let rewrite = |content: &[u8], secs: u64| {
+            std::fs::write(&p0, content).unwrap();
+            let f = std::fs::File::options().write(true).open(&p0).unwrap();
+            f.set_modified(std::time::SystemTime::now() + Duration::from_secs(secs)).unwrap();
+        };
+        rewrite(b"tourne", 10);
+        r.c.turn_done(&p0, true);
+        assert_eq!(r.c.view_quarters(), 1, "ancienne version affichee : toutes les rotations restent dans la vue");
+        let v1 = r.decode.take("i00.jpg", Level::Fit);
+        shown(r.c.on_result(v1, Ok(frame(600, 800))));
+        assert_eq!(r.c.view_quarters(), 0, "la premiere est dans l'image, restent -1 et +1");
+        rewrite(b"tourne 2", 20);
+        r.c.turn_done(&p0, true);
+        rewrite(b"tourne 3", 30);
+        r.c.turn_done(&p0, true);
+        assert_eq!(r.c.turns[&p0].len(), 2);
+        // la derniere version affichee contient tout
+        let v3 = r.decode.take("i00.jpg", Level::Fit);
+        assert_eq!(v3.size, 8);
+        shown(r.c.on_result(v3, Ok(frame(600, 800))));
+        assert_eq!(r.c.view_quarters(), 0);
+        assert!(r.c.turns.is_empty());
+    }
+
+    #[test]
     fn scan_without_the_current_keeps_it_and_relative_paths_are_absolute() {
         let dir = TmpDir::new("ctl-scan");
         for n in ["a.jpg", ".h.jpg", "c.jpg", "IMG_1.HEIC", "IMG_1.MOV"] {
@@ -1131,7 +1322,7 @@ mod tests {
             std::fs::copy(picme_core::fixtures_dir().join(n), dir.path().join(n)).unwrap();
         }
         let store = ThumbStore::new(&root);
-        let ops = FileOps::new(Some(store.clone()));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let work = thumb_work(Some(store.clone()), ops.handle());
         let key = |n: &str| Key::of(&dir::stat_entry(&dir.path().join(n)).unwrap(), Target::Preview);
 
@@ -1149,7 +1340,7 @@ mod tests {
         assert_eq!((n.w, n.h), (128, 96));
         assert!(store.read(&entry("k_thumb.heic"), 256).is_none());
         // seconde lecture : servie par la miniature (meme resultat)
-        let ops = FileOps::new(Some(store.clone()));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let again = thumb_work(Some(store), ops.handle())(&key("a.jpg")).unwrap();
         assert_eq!(again.rgba, t.rgba);
     }
@@ -1160,7 +1351,7 @@ mod tests {
         let root = dir.path().join("thumbnails");
         std::fs::copy(picme_core::fixtures_dir().join("a.jpg"), dir.path().join("a.jpg")).unwrap();
         let store = ThumbStore::new(&root);
-        let ops = FileOps::new(Some(store.clone()));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let work = thumb_work(Some(store.clone()), ops.handle());
         let entry = dir::stat_entry(&dir.path().join("a.jpg")).unwrap();
 
@@ -1169,7 +1360,7 @@ mod tests {
         ops.finish();
         // la miniature large a ete ecrite au passage, et la seconde demande la relit
         assert!(store.read(&entry, 256).is_some());
-        let ops = FileOps::new(Some(store.clone()));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let again = thumb_work(Some(store), ops.handle())(&Key::of(&entry, Target::Strip)).unwrap();
         assert_eq!(again.rgba, strip.rgba);
     }
@@ -1196,7 +1387,7 @@ mod tests {
         let store = ThumbStore::new(&root);
         // a.jpg a 640x480 : sa xx-large est l'image entiere ; la teinte 77 ne vient pas d'un decode
         put_foreign(&store.path_of(&entry, ThumbSize::XXLarge), &entry, (640, 480), 77);
-        let ops = FileOps::new(Some(store.clone()));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let work = thumb_work(Some(store.clone()), ops.handle());
 
         let f = work(&Key::of(&entry, Target::Preview)).unwrap();
@@ -1218,7 +1409,7 @@ mod tests {
         let entry = dir::stat_entry(&dir.path().join("a.jpg")).unwrap();
         let store = ThumbStore::new(&root);
         put_foreign(&store.path_of(&entry, ThumbSize::Normal), &entry, (128, 96), 33);
-        let ops = FileOps::new(Some(store.clone()));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let work = thumb_work(Some(store.clone()), ops.handle());
 
         let f = work(&Key::of(&entry, Target::Preview)).unwrap();
@@ -1241,7 +1432,7 @@ mod tests {
         let store = ThumbStore::new(&root);
         let name = store.path_of(&entry, ThumbSize::Large).file_name().unwrap().to_owned();
         put_foreign(&root.join("fail/gnome-thumbnail-factory").join(name), &entry, (1, 1), 0);
-        let ops = FileOps::new(Some(store.clone()));
+        let ops = FileOps::new(Some(store.clone()), async_channel::unbounded().0);
         let work = thumb_work(Some(store.clone()), ops.handle());
 
         // l'affichage decode quand meme (c'est le travail de picme), mais ne genere pas de miniature

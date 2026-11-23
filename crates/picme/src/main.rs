@@ -3,7 +3,7 @@ use gtk::{gdk, glib, prelude::*};
 use picme::app::{self, Controller, Level, Show};
 use picme::canvas::{self, Canvas};
 use picme::chrome::Chrome;
-use picme::fileops::FileOps;
+use picme::fileops::{Done, FileOps, FileOpsHandle};
 use picme::filmstrip::Filmstrip;
 use picme::keys::{self, Action};
 use picme::monitor::DirWatch;
@@ -11,6 +11,7 @@ use picme::osd::{self, Osd};
 use picme::view::ZOOM_STEP;
 use picme_core::decode::{DEFAULT_BUDGET_BYTES, Frame, Target};
 use picme_core::dir::{self, Entry};
+use picme_core::orient::Orientation;
 use picme_core::pool::{self, Key, Pool};
 use picme_core::thumbs::ThumbStore;
 use std::cell::{Cell, RefCell};
@@ -86,6 +87,11 @@ struct Ui {
     /// Le courant a la derniere mise a jour : un autre fichier remet la vue au fit.
     last_current: RefCell<Option<PathBuf>>,
     watch: RefCell<Option<DirWatch>>,
+    fileops: FileOpsHandle,
+    /// Quarts de tour donnes a la vue depuis sa remise a zero pour suivre `Controller::view_quarters`.
+    turned: Cell<i32>,
+    /// Keycode de la touche Suppr enfoncee : sa repetition ne vide pas le dossier.
+    delete_held: Cell<Option<u32>>,
 }
 
 impl Ui {
@@ -120,11 +126,96 @@ impl Ui {
         }
         if *self.last_current.borrow() != current {
             *self.last_current.borrow_mut() = current;
-            self.canvas.reset_view();
+            self.reset_view();
             self.chrome.pulse();
             self.announce();
         }
         self.sync();
+        self.sync_turns();
+    }
+
+    /// Vue au fit et sans rotation, plus les rotations R que l'image affichee ne contient pas encore.
+    fn reset_view(&self) {
+        self.canvas.reset_view();
+        self.turned.set(0);
+        self.sync_turns();
+    }
+
+    /// La vue suit `Controller::view_quarters` : R en cours d'ecriture, ou sur un format qui ne s'ecrit pas.
+    fn sync_turns(&self) {
+        if !self.canvas.has_image() {
+            return;
+        }
+        let want = self.ctl.borrow_mut().view_quarters();
+        // avant `rotate`, qui revient ici par `connect_view` puis `apply`
+        let delta = want - self.turned.replace(want);
+        if delta != 0 {
+            self.canvas.rotate(delta);
+        }
+    }
+
+    /// R et Maj+R : la vue tourne tout de suite, le fichier ensuite (thread d'ecriture).
+    fn turn(&self, quarters: i32) {
+        let Some(path) = self.ctl.borrow_mut().turn(quarters) else { return };
+        self.sync_turns();
+        let turn = if quarters > 0 { Orientation::Rotate90 } else { Orientation::Rotate270 };
+        if !self.fileops.rotate(path.clone(), turn) {
+            let show = self.ctl.borrow_mut().turn_done(&path, false);
+            self.apply(show);
+            self.osd.message("rotation non enregistrée : écritures arrêtées");
+        }
+    }
+
+    /// Suppr (corbeille) et Maj+Suppr (definitif) : le courant quitte la liste tout de suite, le disque suit.
+    fn remove(&self, trash: bool) {
+        let Some((paths, show)) = self.ctl.borrow_mut().remove_current() else { return };
+        self.apply(show);
+        let sent = if trash { self.fileops.trash(paths.clone()) } else { self.fileops.delete(paths.clone()) };
+        if !sent {
+            for path in &paths {
+                let show = self.ctl.borrow_mut().removal_done(path);
+                self.apply(show);
+            }
+            self.osd.message("fichier conservé : écritures arrêtées");
+        }
+    }
+
+    /// Compte rendu du thread d'ecriture : la liste suit le disque, la vue du fichier touche repart du fit, l'OSD
+    /// le dit.
+    fn on_done(&self, done: Done) {
+        let current = self.ctl.borrow().current().map(|e| e.path.clone());
+        let touched = match &done {
+            Done::Rotated { path, result } => {
+                let show = self.ctl.borrow_mut().turn_done(path, result.is_ok());
+                self.apply(show);
+                vec![path.clone()]
+            }
+            Done::Cropped { path, result } => {
+                if let Ok(c) = result {
+                    let show = self.ctl.borrow_mut().reconcile(&c.path);
+                    self.apply(show);
+                }
+                vec![path.clone()]
+            }
+            Done::Removed { paths, .. } => {
+                for path in paths {
+                    let show = self.ctl.borrow_mut().removal_done(path);
+                    self.apply(show);
+                }
+                paths.clone()
+            }
+        };
+        if current.is_some_and(|c| touched.contains(&c)) {
+            self.reset_view();
+            // `reset_view` ne previent pas le controller : il lache le `Full` d'un zoom en cours
+            let show = self.ctl.borrow_mut().set_full(false);
+            self.apply(show);
+        }
+        let msg = done.message();
+        if !done.ok() {
+            eprintln!("picme : {msg}");
+        }
+        self.osd.message(&msg);
     }
 
     /// Nom, position et zoom du courant, un instant par-dessus l'image.
@@ -200,6 +291,10 @@ impl Ui {
             Action::Fit => self.canvas.fit(),
             Action::RotateRight => self.canvas.rotate(1),
             Action::RotateLeft => self.canvas.rotate(-1),
+            Action::TurnRight => self.turn(1),
+            Action::TurnLeft => self.turn(-1),
+            Action::Trash => self.remove(true),
+            Action::Delete => self.remove(false),
             Action::Fullscreen => {
                 if self.window.is_fullscreen() {
                     self.window.unfullscreen();
@@ -312,7 +407,8 @@ fn main() {
     let (tx, rx) = async_channel::unbounded::<(Key, picme_core::Result<Frame>)>();
     let budget = DEFAULT_BUDGET_BYTES;
     let store = ThumbStore::system();
-    let fileops = FileOps::new(store.clone());
+    let (done_tx, done_rx) = async_channel::unbounded::<Done>();
+    let fileops = FileOps::new(store.clone(), done_tx);
     let first_preview = AtomicBool::new(true);
     let thumb_work = app::thumb_work(store, fileops.handle());
     // le pool `thumbs` sert le controller (`Preview`) et le filmstrip (`Strip`) : un seul proprietaire partage
@@ -407,6 +503,9 @@ fn main() {
         chrome,
         last_current: RefCell::default(),
         watch: RefCell::default(),
+        fileops: fileops.handle(),
+        turned: Cell::new(0),
+        delete_held: Cell::new(None),
     });
     ui.watch_dir();
 
@@ -450,6 +549,15 @@ fn main() {
             while let Ok((key, result)) = rx.recv().await {
                 let Some(ui) = ui.upgrade() else { break };
                 ui.on_result(key, result);
+            }
+        }
+    });
+    glib::spawn_future_local({
+        let ui = Rc::downgrade(&ui);
+        async move {
+            while let Ok(done) = done_rx.recv().await {
+                let Some(ui) = ui.upgrade() else { break };
+                ui.on_done(done);
             }
         }
     });
@@ -512,13 +620,41 @@ fn main() {
     key_ctl.connect_key_pressed({
         let ui = Rc::downgrade(&ui);
         let main_loop = main_loop.clone();
-        move |_, key, _, state| {
+        move |_, key, code, state| {
             let (Some(ui), Some(action)) = (ui.upgrade(), keys::action(key, state)) else { return glib::Propagation::Proceed };
+            // Suppr maintenue : une seule fois, jusqu'au relachement
+            if matches!(action, Action::Trash | Action::Delete) {
+                if ui.delete_held.get().is_some() {
+                    return glib::Propagation::Stop;
+                }
+                ui.delete_held.set(Some(code));
+            }
             ui.act(action, &main_loop);
             glib::Propagation::Stop
         }
     });
+    key_ctl.connect_key_released({
+        let ui = Rc::downgrade(&ui);
+        move |_, _, code, _| {
+            if let Some(ui) = ui.upgrade()
+                && ui.delete_held.get() == Some(code)
+            {
+                ui.delete_held.set(None);
+            }
+        }
+    });
     window.add_controller(key_ctl);
+    // relachement hors de la fenetre : il n'arrivera pas
+    window.connect_is_active_notify({
+        let ui = Rc::downgrade(&ui);
+        move |w| {
+            if let Some(ui) = ui.upgrade()
+                && !w.is_active()
+            {
+                ui.delete_held.set(None);
+            }
+        }
+    });
 
     window.connect_close_request({
         let main_loop = main_loop.clone();
