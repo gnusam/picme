@@ -1,6 +1,18 @@
 # picme
 
-Visionneuse d'images et de vidéos pour Linux (GTK4), pensée pour la vitesse : premier affichage en moins de 250 ms, navigation au clavier, opérations sans perte sur les fichiers. Formats : JPEG, PNG, WebP, TIFF, HEIC et AVIF, JPEG XL, vidéos (MP4, MOV, MKV, WebM, AVI, 3GP), et les RAW avec la feature `raw`.
+Une visionneuse d'images et de vidéos pour Linux. Elle s'ouvre vite, se pilote au clavier, et ne touche à tes fichiers que si tu le demandes. Rien d'autre.
+
+```sh
+picme photo.jpg          # le fichier, son dossier en liste de navigation
+picme -r ~/Photos        # le premier média de tout l'arbre, et les flèches parcourent tout
+```
+
+- **Une seule chose.** Regarder. Pas de bibliothèque, pas d'import, pas d'index, pas de compte, pas de fichier de configuration, aucune dépendance réseau. Un chemin en argument, c'est tout.
+- **Rapide.** Le décodage de la première image démarre avant l'init de GTK. Premier affichage d'un JPEG de 24 MP : environ 280 ms à froid (médiane mesurée avec `PICME_TRACE=1`, dont une centaine de ms d'init GTK). Le décodage ne bloque jamais l'interface, la touche maintenue défile sans à-coup, le cache de textures est borné (256 Mo).
+- **Sans surprise sur tes fichiers.** Rotation JPEG sans recompression, PNG sans perte, écriture atomique. Suppr envoie à la corbeille, Ctrl+Z la reprend pendant 30 s. Aucun état caché : le seul cache est celui des miniatures freedesktop, partagé avec les autres programmes.
+- **Se compose.** Un chemin ou un dossier en argument, `-r` pour l'arbre, un code de sortie honnête, des erreurs sur stderr. Il se lance depuis un shell, un script ou un gestionnaire de fichiers (`picme.desktop`).
+
+Formats : JPEG, PNG, WebP, TIFF, HEIC et AVIF, JPEG XL, vidéos (MP4, MOV, MKV, WebM, AVI, 3GP), GIF, BMP, ICO, QOI, PNM, et les RAW avec la feature `raw`.
 
 ## Architecture
 
