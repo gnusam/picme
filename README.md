@@ -40,6 +40,8 @@ flowchart TB
 
 `picme <fichier>` ouvre le fichier et son dossier devient la liste de navigation, triée par nom. Le bandeau de miniatures (filmstrip) suit l'image courante.
 
+`picme -r [dossier]` (`--recursive`) parcourt aussi les sous-dossiers : il ouvre aussitôt le premier média trouvé dans l'arborescence, et la liste de navigation est tout l'arbre, à plat (les médias d'un dossier, puis ceux de ses sous-dossiers dans l'ordre naturel ; dossiers et fichiers cachés ignorés, liens symboliques vers un dossier non suivis). Une Live Photo ne s'apparie qu'avec un `.mov` du même dossier. Le dossier lui-même n'est surveillé que au premier niveau : un fichier ajouté par un autre programme dans un sous-dossier n'apparaît qu'au prochain lancement ; les opérations de picme (rotation, recadrage, suppression) sont suivies partout. O ouvre le dossier de l'image affichée. Ouvrir un fichier d'un autre arbre (glisser-déposer) revient à la navigation d'un seul dossier.
+
 - Une Live Photo (image HEIC ou JPEG avec le `.mov` du même nom) s'affiche comme une image avec un petit repère `LIVE` ; le `.mov` joue tant que L est tenue.
 - Le `.mov` n'est apparié que si une seule image porte ce nom de base (IMG_0001.HEIC avec IMG_0001.jpg : pas d'appariement) et s'il pèse moins de 15 Mio ; sinon il reste une vidéo à part entière, avec sa propre entrée, et Suppr sur l'image ne touche pas à lui. Un apparié part à la corbeille avec son image.
 - Une vidéo démarre à l'ouverture, sans son. M active le son ; si la sortie audio manque, le son se coupe de nouveau et un message le dit.

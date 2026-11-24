@@ -117,11 +117,11 @@ struct Ui {
 type ScanResult = (PathBuf, std::io::Result<Vec<Entry>>);
 
 /// Liste `dir` sur un autre thread : la fenetre ne l'attend pas.
-fn spawn_scan(dir: PathBuf, tx: async_channel::Sender<ScanResult>) {
+fn spawn_scan(dir: PathBuf, recursive: bool, tx: async_channel::Sender<ScanResult>) {
     std::thread::Builder::new()
         .name("picme-scan".into())
         .spawn(move || {
-            let list = dir::list(&dir);
+            let list = if recursive { dir::list_tree(&dir) } else { dir::list(&dir) };
             let _ = tx.send_blocking((dir, list));
         })
         .expect("thread scan");
@@ -130,7 +130,11 @@ fn spawn_scan(dir: PathBuf, tx: async_channel::Sender<ScanResult>) {
 impl Ui {
     /// O : le dossier courant dans le gestionnaire de fichiers du systeme (handler `inode/directory`).
     fn open_folder(&self) {
-        let Some(dir) = self.ctl.borrow().dir().map(Path::to_path_buf) else { return };
+        let ctl = self.ctl.borrow();
+        // en mode `-r` le dossier de la liste est la racine : on ouvre celui de l'image affichee
+        let dir = ctl.current().and_then(|e| e.path.parent().map(Path::to_path_buf)).or_else(|| ctl.dir().map(Path::to_path_buf));
+        drop(ctl);
+        let Some(dir) = dir else { return };
         let uri = gtk4::gio::File::for_path(&dir).uri();
         match gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
             Ok(()) => self.osd.message("dossier ouvert"),
@@ -371,7 +375,7 @@ impl Ui {
         }
         if self.ctl.borrow().dir().map(Path::to_path_buf) != before {
             if let Some(dir) = self.ctl.borrow().dir().map(Path::to_path_buf) {
-                spawn_scan(dir, self.scan_tx.clone());
+                spawn_scan(dir, self.ctl.borrow().recursive(), self.scan_tx.clone());
             }
             self.watch_dir();
         }
@@ -689,6 +693,7 @@ fn main() {
     trace.mark("process start");
 
     // l'argument d'abord : l'aide, la version et les erreurs de chemin ne demandent ni pool ni fenetre
+    let recursive_arg;
     let arg = match launch::parse_args(std::env::args_os().skip(1)) {
         Ok(Cli::Help) => {
             print!("{}", launch::USAGE);
@@ -698,7 +703,10 @@ fn main() {
             println!("{}", launch::version());
             return;
         }
-        Ok(Cli::Open(arg)) => arg,
+        Ok(Cli::Open { path, recursive }) => {
+            recursive_arg = recursive;
+            path
+        }
         Err(msg) => {
             eprintln!("picme : {msg}\nusage : picme [FICHIER|DOSSIER]... (picme --help)");
             std::process::exit(2);
@@ -752,9 +760,16 @@ fn main() {
     // un fichier donne s'affiche ; sinon le premier media du dossier, trouve sans attendre le listing complet (le
     // scan ci-dessous le rend), et un dossier sans media s'ouvre vide, surveille
     let mut empty = false;
+    ctl.set_recursive(recursive_arg);
     let opened = match &launch.file {
-        Some(file) => ctl.open(file),
-        None => match dir::first(&launch.dir) {
+        Some(file) => {
+            // `-r` avec un fichier : la liste est l'arbre de son dossier, pas un autre
+            if recursive_arg {
+                ctl.set_dir_scope(&launch.dir);
+            }
+            ctl.open(file)
+        }
+        None => match if recursive_arg { dir::first_tree(&launch.dir) } else { dir::first(&launch.dir) } {
             Ok(dir::First::Found(first)) => {
                 trace.mark("first entry found");
                 ctl.open(&first.path)
@@ -780,7 +795,7 @@ fn main() {
     // scan du dossier sur un autre thread : la fenetre ne l'attend pas
     let (scan_tx, scan_rx) = async_channel::unbounded::<ScanResult>();
     if let Some(d) = ctl.dir().map(|d| d.to_path_buf()) {
-        spawn_scan(d, scan_tx.clone());
+        spawn_scan(d, ctl.recursive(), scan_tx.clone());
     }
 
     if let Err(e) = gtk::init() {

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub const USAGE: &str = "\
 picme : visionneuse d'images et de vidéos
 
-Usage : picme [FICHIER|DOSSIER]...
+Usage : picme [-r] [FICHIER|DOSSIER]...
 
   (rien)   ouvre le dossier courant
   DOSSIER  ouvre ce dossier et affiche son premier média, dans l'ordre de navigation
@@ -17,6 +17,8 @@ Usage : picme [FICHIER|DOSSIER]...
            (plusieurs fichiers : seul le premier compte)
 
 Options :
+  -r, --recursive  parcourt aussi les sous-dossiers : ouvre le premier média trouvé dans l'arborescence, et les flèches
+                   enchaînent tous les dossiers (les médias d'un dossier, puis ceux de ses sous-dossiers)
   -h, --help     affiche cette aide
   -V, --version  affiche la version
 ";
@@ -29,19 +31,24 @@ pub fn version() -> String {
 pub enum Cli {
     Help,
     Version,
-    /// Le premier chemin donne, s'il y en a un.
-    Open(Option<PathBuf>),
+    /// Le premier chemin donne, s'il y en a un ; `recursive` (`-r`) : la liste de navigation est tout l'arbre.
+    Open { path: Option<PathBuf>, recursive: bool },
 }
 
 /// Les arguments apres le nom du programme. `--` finit les options (un fichier nomme `-x`).
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
     let mut path = None;
+    let mut recursive = false;
     let mut options = true;
     for arg in args {
         if options {
             match arg.to_str() {
                 Some("-h" | "--help") => return Ok(Cli::Help),
                 Some("-V" | "--version") => return Ok(Cli::Version),
+                Some("-r" | "--recursive") => {
+                    recursive = true;
+                    continue;
+                }
                 Some("--") => {
                     options = false;
                     continue;
@@ -52,7 +59,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, Strin
         }
         path.get_or_insert_with(|| PathBuf::from(arg));
     }
-    Ok(Cli::Open(path))
+    Ok(Cli::Open { path, recursive })
 }
 
 /// Ce que l'application ouvre.
@@ -114,16 +121,26 @@ mod tests {
 
     #[test]
     fn parses_help_version_and_the_first_path() {
-        assert_eq!(args(&[]), Ok(Cli::Open(None)));
-        assert_eq!(args(&["a.jpg", "b.jpg"]), Ok(Cli::Open(Some("a.jpg".into()))));
+        assert_eq!(args(&[]), Ok(Cli::Open { path: None, recursive: false }));
+        assert_eq!(args(&["a.jpg", "b.jpg"]), Ok(Cli::Open { path: Some("a.jpg".into()), recursive: false }));
         assert_eq!(args(&["--help"]), Ok(Cli::Help));
         assert_eq!(args(&["-h"]), Ok(Cli::Help));
         assert_eq!(args(&["a.jpg", "--version"]), Ok(Cli::Version));
         assert_eq!(args(&["-V"]), Ok(Cli::Version));
         assert_eq!(args(&["--zoom"]), Err("option inconnue : --zoom".to_string()));
         // `--` : la suite est un chemin, meme avec un tiret
-        assert_eq!(args(&["--", "-x.jpg", "--help"]), Ok(Cli::Open(Some("-x.jpg".into()))));
-        assert_eq!(args(&["-"]), Ok(Cli::Open(Some("-".into()))));
+        assert_eq!(args(&["--", "-x.jpg", "--help"]), Ok(Cli::Open { path: Some("-x.jpg".into()), recursive: false }));
+        assert_eq!(args(&["-"]), Ok(Cli::Open { path: Some("-".into()), recursive: false }));
+    }
+
+    #[test]
+    fn dash_r_is_an_option_wherever_it_stands() {
+        let rec = |p: Option<&str>| Ok(Cli::Open { path: p.map(PathBuf::from), recursive: true });
+        assert_eq!(args(&["-r"]), rec(None));
+        assert_eq!(args(&["--recursive", "d"]), rec(Some("d")));
+        assert_eq!(args(&["d", "-r"]), rec(Some("d")));
+        // apres `--`, c'est un nom de fichier
+        assert_eq!(args(&["--", "-r"]), Ok(Cli::Open { path: Some("-r".into()), recursive: false }));
     }
 
     #[test]

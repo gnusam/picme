@@ -73,8 +73,82 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
             entries.push(e);
         }
     }
-    entries.sort_by(|a, b| natural_cmp(&file_name(&a.path), &file_name(&b.path)));
+    entries.sort_by(entry_cmp);
     Ok(pair_live_photos(entries))
+}
+
+/// Comme `list`, sur tout l'arbre sous `root` (`picme -r`) : les sous-dossiers sont parcourus, les dossiers et fichiers
+/// caches ignores, les liens symboliques vers un dossier non suivis (pas de boucle). L'ordre est celui de `entry_cmp` :
+/// les medias d'un dossier, puis ceux de ses sous-dossiers dans l'ordre naturel. Seule l'erreur de `root` remonte ; un
+/// sous-dossier illisible est sauté.
+pub fn list_tree(root: &Path) -> io::Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut first = true;
+    while let Some(dir) = pending.pop() {
+        let items = match std::fs::read_dir(&dir) {
+            Ok(items) => items,
+            Err(e) if first => return Err(e),
+            Err(_) => continue,
+        };
+        first = false;
+        for item in items.flatten() {
+            let path = item.path();
+            if path.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b".")) {
+                continue;
+            }
+            if item.file_type().is_ok_and(|t| t.is_dir()) {
+                pending.push(path);
+            } else if let Some(e) = stat_entry(&path) {
+                entries.push(e);
+            }
+        }
+    }
+    entries.sort_by(entry_cmp);
+    Ok(pair_live_photos(entries))
+}
+
+/// Les sous-dossiers de `dir` (ni caches ni liens symboliques), dans l'ordre naturel.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(items) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut dirs: Vec<PathBuf> = items
+        .flatten()
+        .filter(|i| i.file_type().is_ok_and(|t| t.is_dir()) && !i.file_name().as_encoded_bytes().starts_with(b"."))
+        .map(|i| i.path())
+        .collect();
+    dirs.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
+    dirs
+}
+
+/// La premiere entree de `list_tree(root)`, sans lister l'arbre : `first` sur le dossier, puis sur ses sous-dossiers
+/// dans l'ordre, et on s'arrete au premier media. `Undecided` des que `first` ne peut trancher dans un dossier.
+pub fn first_tree(root: &Path) -> io::Result<First> {
+    match first(root)? {
+        First::Empty => {}
+        found => return Ok(found),
+    }
+    for sub in subdirs(root) {
+        match first_tree(&sub) {
+            Ok(First::Empty) | Err(_) => {}
+            Ok(found) => return Ok(found),
+        }
+    }
+    Ok(First::Empty)
+}
+
+/// L'ordre d'une liste : dans un meme dossier, le nom en ordre naturel ; entre dossiers, ceux d'un dossier passent avant
+/// ceux de ses sous-dossiers, et deux sous-dossiers freres se comparent par leur nom en ordre naturel.
+pub fn entry_cmp(a: &Entry, b: &Entry) -> Ordering {
+    let (mut pa, mut pb) = (a.path.parent().into_iter().flat_map(Path::components), b.path.parent().into_iter().flat_map(Path::components));
+    loop {
+        match (pa.next(), pb.next()) {
+            (None, None) => return natural_cmp(&file_name(&a.path), &file_name(&b.path)),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x == y => {}
+            (Some(x), Some(y)) => return natural_cmp(&x.as_os_str().to_string_lossy(), &y.as_os_str().to_string_lossy()),
+        }
+    }
 }
 
 /// Ouvertures de fichiers a extension inconnue que `first` accepte avant de renoncer (`First::Undecided`).
@@ -164,8 +238,7 @@ pub fn reject_reason(path: &Path) -> String {
 
 /// Insere `entry` a sa place dans une liste triee par `list` ; rend son index.
 pub fn insert_sorted(entries: &mut Vec<Entry>, entry: Entry) -> usize {
-    let name = file_name(&entry.path);
-    let i = entries.partition_point(|e| natural_cmp(&file_name(&e.path), &name) == Ordering::Less);
+    let i = entries.partition_point(|e| entry_cmp(e, &entry) == Ordering::Less);
     entries.insert(i, entry);
     i
 }
@@ -271,8 +344,10 @@ fn file_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Le dossier et le stem sans casse : deux fichiers de meme stem dans deux dossiers (`list_tree`) ne s'apparient pas.
 fn stem_key(p: &Path) -> String {
-    p.file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
+    let stem = p.file_stem().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    format!("{}\0{stem}", p.parent().map(|d| d.to_string_lossy()).unwrap_or_default())
 }
 
 fn is_mov(e: &Entry) -> bool {
@@ -378,6 +453,73 @@ mod tests {
         assert_ne!(natural_cmp("A1", "a1"), Ordering::Equal);
         assert_eq!(natural_cmp("a", "a1"), Ordering::Less);
         assert_eq!(natural_cmp("é1", "é2"), Ordering::Less);
+    }
+
+    fn touch(root: &Path, rel: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    fn rels(root: &Path, list: &[Entry]) -> Vec<String> {
+        list.iter().map(|e| e.path.strip_prefix(root).unwrap().to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn list_tree_walks_subdirs_files_before_subdirs_and_skips_hidden() {
+        let dir = TmpDir::new("dir-tree");
+        for rel in [
+            "b.jpg", "a.jpg", "z/1.jpg", "z/deep/1.jpg", "z/deep/x.txt", "a10/1.jpg", "a2/1.jpg", ".hid/1.jpg", "e/.h.jpg",
+            "notes.txt", "vide/rien.txt",
+        ] {
+            touch(dir.path(), rel);
+        }
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("boucle")).unwrap();
+        let got = list_tree(dir.path()).unwrap();
+        assert_eq!(rels(dir.path(), &got), ["a.jpg", "b.jpg", "a2/1.jpg", "a10/1.jpg", "z/1.jpg", "z/deep/1.jpg"]);
+        assert_eq!(first_tree(dir.path()).unwrap(), First::Found(got[0].clone()));
+    }
+
+    #[test]
+    fn first_tree_descends_into_the_first_subdir_that_has_a_media() {
+        let dir = TmpDir::new("dir-tree-first");
+        for rel in ["a/notes.txt", "b/deep/pic.jpg", "c/1.jpg", "top.txt"] {
+            touch(dir.path(), rel);
+        }
+        let got = list_tree(dir.path()).unwrap();
+        assert_eq!(rels(dir.path(), &got), ["b/deep/pic.jpg", "c/1.jpg"]);
+        assert_eq!(first_tree(dir.path()).unwrap(), First::Found(got[0].clone()));
+        let empty = TmpDir::new("dir-tree-empty");
+        touch(empty.path(), "a/b.txt");
+        assert_eq!(first_tree(empty.path()).unwrap(), First::Empty);
+        assert!(list_tree(empty.path()).unwrap().is_empty());
+        assert!(list_tree(&empty.path().join("absent")).is_err());
+    }
+
+    #[test]
+    fn live_photos_pair_within_their_own_dir_only() {
+        let dir = TmpDir::new("dir-tree-live");
+        for rel in ["a/IMG_1.HEIC", "b/IMG_1.MOV", "c/IMG_2.HEIC", "c/IMG_2.MOV"] {
+            touch(dir.path(), rel);
+        }
+        let got = list_tree(dir.path()).unwrap();
+        assert_eq!(rels(dir.path(), &got), ["a/IMG_1.HEIC", "b/IMG_1.MOV", "c/IMG_2.HEIC"]);
+        assert_eq!(got[2].live_mov.as_deref(), Some(dir.path().join("c/IMG_2.MOV").as_path()));
+        assert_eq!(got[0].live_mov, None);
+    }
+
+    #[test]
+    fn insert_sorted_keeps_the_tree_order() {
+        let dir = TmpDir::new("dir-tree-insert");
+        for rel in ["a.jpg", "c/1.jpg", "m.jpg", "z/1.jpg"] {
+            touch(dir.path(), rel);
+        }
+        let mut got = list_tree(dir.path()).unwrap();
+        touch(dir.path(), "b/1.jpg");
+        let new = stat_entry(&dir.path().join("b/1.jpg")).unwrap();
+        insert_sorted(&mut got, new);
+        assert_eq!(rels(dir.path(), &got), ["a.jpg", "m.jpg", "b/1.jpg", "c/1.jpg", "z/1.jpg"]);
+        assert_eq!(rels(dir.path(), &list_tree(dir.path()).unwrap()), rels(dir.path(), &got));
     }
 
     #[test]

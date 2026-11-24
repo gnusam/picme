@@ -186,6 +186,8 @@ pub struct Controller<T> {
     entries: Vec<Entry>,
     /// Dossier liste (absolu) : les evenements et scans d'un autre dossier sont ignores.
     dir: Option<PathBuf>,
+    /// `picme -r` : la liste couvre tout l'arbre sous `dir`, pas ce seul dossier.
+    recursive: bool,
     current: Option<PathBuf>,
     /// Sens du dernier deplacement (+1 ou -1) : les voisins se prechargent dans ce sens d'abord.
     step: isize,
@@ -227,6 +229,7 @@ impl<T: Clone> Controller<T> {
         Controller {
             entries: Vec::new(),
             dir: None,
+            recursive: false,
             current: None,
             step: 1,
             last_go: None,
@@ -258,6 +261,29 @@ impl<T: Clone> Controller<T> {
         self.dir.as_deref()
     }
 
+    /// Mode `-r` : a regler avant `open` / `open_dir`. Il retombe tout seul des qu'on ouvre un fichier hors de l'arbre.
+    pub fn set_recursive(&mut self, on: bool) {
+        self.recursive = on;
+    }
+
+    /// Racine de la liste avant l'ouverture d'un fichier qu'elle contiendra (`-r FICHIER`).
+    pub fn set_dir_scope(&mut self, dir: &Path) {
+        self.dir = Some(dir.to_path_buf());
+    }
+
+    pub fn recursive(&self) -> bool {
+        self.recursive
+    }
+
+    /// `path` appartient a la liste du dossier courant : son dossier, ou tout l'arbre en mode `-r`.
+    fn in_scope(&self, path: &Path) -> bool {
+        match self.dir.as_deref() {
+            Some(d) if self.recursive => path.starts_with(d),
+            Some(d) => path.parent() == Some(d),
+            None => false,
+        }
+    }
+
     /// Numero de version du contenu de la liste (insertion, retrait, fichier modifie, nouveau scan).
     pub fn rev(&self) -> u64 {
         self.rev
@@ -286,10 +312,10 @@ impl<T: Clone> Controller<T> {
             let Some(entry) = dir::stat_entry_explicit(&path) else {
                 return Show::Failed(format!("{} : {}", path.display(), dir::reject_reason(&path)));
             };
-            let parent = path.parent().map(Path::to_path_buf);
-            if parent != self.dir {
+            if !self.in_scope(&path) {
                 self.entries = vec![entry];
-                self.dir = parent;
+                self.dir = path.parent().map(Path::to_path_buf);
+                self.recursive = false;
             } else {
                 dir::insert_sorted(&mut self.entries, entry);
             }
@@ -393,7 +419,7 @@ impl<T: Clone> Controller<T> {
 
     /// Re-stat de `path` apres un evenement du dossier (ou une operation de picme). Idempotent.
     pub fn reconcile(&mut self, path: &Path) -> Show<T> {
-        if self.dir.is_none() || path.parent() != self.dir.as_deref() || self.removing.contains(path) {
+        if !self.in_scope(path) || self.removing.contains(path) {
             return Show::Keep;
         }
         let before = self.index();
@@ -1431,6 +1457,39 @@ mod tests {
         shown(r.c.on_result(v3, Ok(frame(600, 800))));
         assert_eq!(r.c.view_quarters(), 0);
         assert!(r.c.turns.is_empty());
+    }
+
+    #[test]
+    fn recursive_list_spans_subdirs_and_falls_back_outside_the_tree() {
+        let dir = TmpDir::new("ctl-recursive");
+        for n in ["a.jpg", "sub/b.jpg", "sub/deep/c.jpg"] {
+            let p = dir.path().join(n);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+        let other = TmpDir::new("ctl-recursive-other");
+        std::fs::write(other.path().join("z.jpg"), b"x").unwrap();
+        let (decode, thumbs) = (Rc::new(Fake::default()), Rc::new(Fake::default()));
+        let mut c: Controller<Tex> = Controller::new(1 << 20, Box::new(FakeJobs(decode)), Box::new(FakeJobs(thumbs)), Box::new(|f: Frame| (f.w, f.h)));
+        c.set_recursive(true);
+        c.open_dir(dir.path());
+        c.set_entries(dir.path(), dir::list_tree(dir.path()).unwrap());
+        assert_eq!(c.current().unwrap().path, dir.path().join("a.jpg"));
+        c.go(1);
+        assert_eq!(c.current().unwrap().path, dir.path().join("sub/b.jpg"));
+        c.go(1);
+        assert_eq!(c.current().unwrap().path, dir.path().join("sub/deep/c.jpg"));
+
+        // un fichier cree dans un sous-dossier entre dans la liste, a sa place
+        std::fs::write(dir.path().join("sub/a2.jpg"), b"x").unwrap();
+        c.reconcile(&dir.path().join("sub/a2.jpg"));
+        let names: Vec<_> = c.entries().iter().map(|e| e.path.strip_prefix(dir.path()).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["a.jpg", "sub/a2.jpg", "sub/b.jpg", "sub/deep/c.jpg"]);
+
+        // un fichier d'un autre arbre : la liste devient ce dossier, sans recursion
+        c.open(&other.path().join("z.jpg"));
+        assert_eq!(c.dir(), Some(other.path()));
+        assert!(!c.recursive());
     }
 
     #[test]
