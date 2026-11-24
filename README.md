@@ -59,6 +59,29 @@ flowchart TB
 - Une vidéo démarre à l'ouverture, sans son. M active le son ; si la sortie audio manque, le son se coupe de nouveau et un message le dit.
 - Une touche tenue répète : Droite tenue fait défiler les images, Suppr tenue ne supprime qu'un fichier.
 
+## Comparaison
+
+Ce que picme fait et ne fait pas, face aux visionneuses courantes sous Linux. Relevé le 24/11/2026 dans les man pages, READMEs et sources de chaque projet ; « n.t. » veut dire que je n'ai rien trouvé qui le confirme, pas que la fonction n'existe pas. Une correction est la bienvenue.
+
+| | picme | feh | nsxiv | imv | eog | Loupe | Gwenview | Geeqie |
+|---|---|---|---|---|---|---|---|---|
+| Toolkit | GTK4 | Imlib2 | Imlib2 | GL | GTK3 | GTK4 | Qt6 | GTK4 |
+| Wayland natif | non (X11) | non | non | oui | oui | oui | oui | partiel |
+| Vidéo intégrée | oui | non | non | non | non | non | oui | aperçu seul |
+| HEIC, AVIF, JPEG XL | oui | selon Imlib2 | selon Imlib2 | oui (option) | loaders tiers | oui | plugins Qt | oui (option) |
+| Rotation JPEG sans perte, écrite dans le fichier | oui | partiel (jpegtran) | non | non | oui | oui (tag EXIF) | oui | oui |
+| Recadrage qui écrit le fichier | oui | non | non | non | non | oui | oui | copie seulement |
+| Suppression vers la corbeille | oui | non | non | non | oui | oui | oui | oui |
+| Annuler une suppression | oui (30 s) | non | non | non | non | oui | non | partiel |
+| Navigation récursive | oui (`-r`) | oui | oui | oui | non | non | n.t. | partiel |
+| Bandeau de miniatures | oui | non | non | non | oui | non | oui | n.t. |
+| Cache de miniatures freedesktop | oui | partiel | non | non | oui | n.t. | oui | oui |
+| GIF animé | non | non | oui | oui | oui | oui | n.t. | oui |
+| Diaporama | non | oui | oui | oui | oui | n.t. | oui | oui |
+| Panneau EXIF | non | partiel | partiel | non | oui | oui | oui | oui |
+
+Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, la corbeille avec annulation et les opérations sans perte sur les fichiers, dans une fenêtre qui se pilote au clavier. En contrepartie, il n'a ni Wayland natif, ni GIF animé, ni diaporama, ni panneau EXIF. Si tu cherches un outil minimal pour un window manager X11, feh et nsxiv font moins de choses et le font très bien ; si tu veux tout cela dans une application de bureau complète, regarde Gwenview.
+
 ## Raccourcis
 
 | Touche | Action |
