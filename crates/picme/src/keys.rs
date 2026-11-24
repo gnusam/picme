@@ -28,6 +28,8 @@ pub enum Action {
     Fullscreen,
     /// O : ouvre le dossier courant dans le gestionnaire de fichiers du systeme.
     OpenFolder,
+    /// ? ou F1 : panneau d'aide des raccourcis.
+    Help,
     Quit,
     /// C : cadre de recadrage sur l'image.
     Crop,
@@ -108,6 +110,7 @@ pub fn action(key: Key, state: ModifierType, ctx: Ctx) -> Option<Action> {
         Key::Delete | Key::KP_Delete => Action::Trash,
         Key::F11 => Action::Fullscreen,
         Key::o => Action::OpenFolder,
+        Key::question | Key::F1 => Action::Help,
         Key::q | Key::Escape => Action::Quit,
         _ => return None,
     })
@@ -148,6 +151,8 @@ mod tests {
     fn quit_keys_and_zoom_keys() {
         assert_eq!(action(Key::q, NONE), Some(Action::Quit));
         assert_eq!(action(Key::o, NONE), Some(Action::OpenFolder));
+        assert_eq!(action(Key::question, SHIFT), Some(Action::Help));
+        assert_eq!(action(Key::F1, NONE), Some(Action::Help));
         assert_eq!(action(Key::Q, ModifierType::SHIFT_MASK), Some(Action::Quit));
         assert_eq!(action(Key::Escape, NONE), Some(Action::Quit));
         assert_eq!(action(Key::plus, NONE), Some(Action::ZoomIn));

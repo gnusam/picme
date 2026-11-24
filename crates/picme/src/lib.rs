@@ -7,6 +7,7 @@ pub mod crop;
 pub mod dnd;
 pub mod fileops;
 pub mod filmstrip;
+pub mod help;
 pub mod keys;
 pub mod launch;
 pub mod monitor;

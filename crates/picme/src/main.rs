@@ -8,6 +8,7 @@ use picme::crop::Cropper;
 use picme::dnd;
 use picme::fileops::{Done, FileOps, FileOpsHandle};
 use picme::filmstrip::Filmstrip;
+use picme::help::Help;
 use picme::keys::{self, Action, Ctx};
 use picme::launch::{self, Cli};
 use picme::monitor::DirWatch;
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 const CSS: &str = "
 window { background: #000; }
 .osd { background: rgba(0, 0, 0, 0.6); color: #eee; padding: 4px 10px; border-radius: 6px; font-size: 13px; }
+.help { padding: 18px 26px; font-size: 14px; background: rgba(0, 0, 0, 0.82); border-radius: 10px; }
 .live-badge { background: rgba(0, 0, 0, 0.6); color: #eee; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
 .strip-bar { background: rgba(0, 0, 0, 0.7); }
 .strip { background: transparent; }
@@ -86,6 +88,7 @@ struct Ui {
     /// Fin de repetition programmee (`Controller::settle`).
     settle: RefCell<Option<glib::SourceId>>,
     osd: Rc<Osd>,
+    help: Help,
     strip: Rc<Filmstrip>,
     chrome: Rc<Chrome>,
     /// Le courant a la derniere mise a jour : un autre fichier remet la vue au fit.
@@ -553,6 +556,7 @@ impl Ui {
             Action::TurnRight => self.turn(1),
             Action::TurnLeft => self.turn(-1),
             Action::OpenFolder => self.open_folder(),
+            Action::Help => self.help.toggle(),
             Action::Trash => self.remove(true),
             Action::Delete => self.remove(false),
             Action::Fullscreen => {
@@ -810,6 +814,8 @@ fn main() {
     overlay.add_overlay(&live_badge);
     overlay.add_overlay(&revealer);
     osd.attach(&overlay);
+    let help = Help::new();
+    help.attach(&overlay);
     window.set_child(Some(&overlay));
     let chrome = Chrome::new(&window, &revealer);
 
@@ -836,6 +842,7 @@ fn main() {
         painted_image: Cell::new(false),
         settle: RefCell::default(),
         osd,
+        help,
         strip: strip.clone(),
         chrome,
         last_current: RefCell::default(),
@@ -998,6 +1005,11 @@ fn main() {
         let main_loop = main_loop.clone();
         move |_, key, code, state| {
             let Some(ui) = ui.upgrade() else { return glib::Propagation::Proceed };
+            // l'aide ouverte : la touche la ferme et ne fait rien d'autre
+            if ui.help.visible() {
+                ui.help.hide();
+                return glib::Propagation::Stop;
+            }
             let Some(action) = keys::action(key, state, ui.ctx()) else { return glib::Propagation::Proceed };
             // Suppr maintenue : une seule fois, jusqu'au relachement
             if matches!(action, Action::Trash | Action::Delete) {

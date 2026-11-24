@@ -63,6 +63,7 @@ flowchart TB
 | M | son de la vidéo (coupé par défaut) |
 | L | tenue : joue la vidéo d'une Live Photo |
 | F11 | plein écran |
+| ?, F1 | aide : la liste des raccourcis par-dessus l'image, une touche la ferme |
 | O | ouvre le dossier courant dans le gestionnaire de fichiers du système |
 | Q, Échap | quitter (Échap annule d'abord un recadrage) |
 
