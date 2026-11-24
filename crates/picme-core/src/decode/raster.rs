@@ -1,4 +1,4 @@
-//! PNG, WebP et TIFF par la crate `image` : decode complet, puis reduction.
+//! PNG, WebP, TIFF, GIF (premiere image), BMP, ICO, QOI et PNM par la crate `image` : decode complet, puis reduction.
 
 use super::{Frame, Plan, Target};
 use crate::error::{Error, Result};
@@ -14,6 +14,11 @@ fn format_of(kind: MediaKind) -> Result<ImageFormat> {
         MediaKind::Png => Ok(ImageFormat::Png),
         MediaKind::Webp => Ok(ImageFormat::WebP),
         MediaKind::Tiff => Ok(ImageFormat::Tiff),
+        MediaKind::Gif => Ok(ImageFormat::Gif),
+        MediaKind::Bmp => Ok(ImageFormat::Bmp),
+        MediaKind::Ico => Ok(ImageFormat::Ico),
+        MediaKind::Qoi => Ok(ImageFormat::Qoi),
+        MediaKind::Pnm => Ok(ImageFormat::Pnm),
         other => Err(Error::Unsupported(format!("{other:?} n'est pas un format raster"))),
     }
 }

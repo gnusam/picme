@@ -1,6 +1,7 @@
-//! Listing d'un dossier : filtre par extension, tri naturel insensible a la casse, pairing Live Photo.
+//! Listing d'un dossier : filtre par extension (les extensions inconnues sont lues par contenu), tri naturel
+//! insensible a la casse, pairing Live Photo.
 
-use crate::media::{MediaKind, kind_from_path};
+use crate::media::{self, MediaKind, kind_from_path};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
@@ -23,14 +24,32 @@ pub struct Entry {
 }
 
 /// Entree d'un seul fichier (re-stat apres un evenement du dossier). `None` si le fichier a disparu, n'est pas
-/// un fichier regulier ou n'a pas une extension de media. Le `kind` vient de l'extension : le listing n'ouvre
-/// aucun fichier, `decode` re-detecte par magic bytes.
+/// un fichier regulier, ou n'est pas un media. Une extension de media connue donne le `kind` sans ouvrir le fichier
+/// (`decode` re-detecte par magic bytes, le contenu l'emporte) ; une extension inconnue ou absente, sauf celles de
+/// `media::is_non_media_extension`, est lue par ses premiers octets (`media::sniff_path`) ; un fichier illisible est
+/// ignore.
 pub fn stat_entry(path: &Path) -> Option<Entry> {
-    let kind = kind_from_path(path)?;
+    stat_entry_as(path, false)
+}
+
+/// Comme `stat_entry` pour un fichier que l'utilisateur a nomme : toute extension est lue par contenu, y compris
+/// celles qu'un listing n'ouvre pas.
+pub fn stat_entry_explicit(path: &Path) -> Option<Entry> {
+    stat_entry_as(path, true)
+}
+
+fn stat_entry_as(path: &Path, explicit: bool) -> Option<Entry> {
+    // le stat d'abord : on n'ouvre ni dossier ni FIFO ni peripherique pour en lire la tete
     let md = std::fs::metadata(path).ok()?;
     if !md.is_file() {
         return None;
     }
+    let ext = path.extension().and_then(|e| e.to_str());
+    let kind = match ext.and_then(media::kind_from_extension) {
+        Some(kind) => kind,
+        None if !explicit && ext.is_some_and(media::is_non_media_extension) => return None,
+        None => media::sniff_path(path).ok()??,
+    };
     Some(Entry {
         path: path.to_path_buf(),
         kind,
@@ -56,6 +75,91 @@ pub fn list(dir: &Path) -> io::Result<Vec<Entry>> {
     }
     entries.sort_by(|a, b| natural_cmp(&file_name(&a.path), &file_name(&b.path)));
     Ok(pair_live_photos(entries))
+}
+
+/// Ouvertures de fichiers a extension inconnue que `first` accepte avant de renoncer (`First::Undecided`).
+pub const FIRST_SNIFF_BUDGET: usize = 256;
+
+/// Resultat de `first`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum First {
+    Found(Entry),
+    /// Le dossier n'a aucun media.
+    Empty,
+    /// Trop de fichiers a extension inconnue avant le premier media : seul le listing complet peut trancher.
+    Undecided,
+}
+
+/// La premiere entree de `list(dir)`, sans stat ni tri de tout le dossier : une passe sur les noms (extension, non
+/// cache), puis le stat des seuls candidats, dans l'ordre naturel. Meme resultat que `list(dir).first()`, `live_mov`
+/// compris : un `.mov` de Live Photo qui trie avant son image est ecarte (il est dans l'entree de l'image). Un candidat
+/// a extension inconnue est lu par contenu (un fichier de plus a ouvrir) : au-dela de `FIRST_SNIFF_BUDGET` de ces
+/// lectures sans media trouve, `Undecided`.
+pub fn first(dir: &Path) -> io::Result<First> {
+    let mut names: Vec<(String, PathBuf)> = Vec::new();
+    for item in std::fs::read_dir(dir)? {
+        let path = item?.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        let hidden = path.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b"."));
+        if hidden || ext.is_some_and(|e| kind_from_path(&path).is_none() && media::is_non_media_extension(e)) {
+            continue;
+        }
+        names.push((file_name(&path), path));
+    }
+    // les candidats ecartes (dossier, fichier disparu, `.mov` de Live Photo) ; ils restent dans `names` pour l'appariement
+    let mut dropped = vec![false; names.len()];
+    let mut sniffs = 0;
+    loop {
+        let Some(i) = (0..names.len()).filter(|&i| !dropped[i]).min_by(|&a, &b| natural_cmp(&names[a].0, &names[b].0)) else {
+            return Ok(First::Empty);
+        };
+        dropped[i] = true;
+        if kind_from_path(&names[i].1).is_none() {
+            sniffs += 1;
+            if sniffs > FIRST_SNIFF_BUDGET {
+                return Ok(First::Undecided);
+            }
+        }
+        let Some(mut entry) = stat_entry(&names[i].1) else { continue };
+        let stem = stem_key(&entry.path);
+        let mut group: Vec<Entry> = names.iter().filter(|(_, p)| stem_key(p) == stem).filter_map(|(_, p)| stat_entry(p)).collect();
+        group.sort_by(|a, b| natural_cmp(&file_name(&a.path), &file_name(&b.path)));
+        // un `.mov` de Live Photo : le premier de son stem, et une seule image portant ce stem
+        let unique_image = group.iter().filter(|e| e.kind != MediaKind::Video).count() == 1;
+        let live = group.iter().find(|e| is_live_mov(e)).filter(|_| unique_image);
+        if is_live_mov(&entry) && live.is_some_and(|m| m.path == entry.path) {
+            continue;
+        }
+        if entry.kind != MediaKind::Video {
+            entry.live_mov = live.map(|m| m.path.clone());
+        }
+        return Ok(First::Found(entry));
+    }
+}
+
+/// L'erreur d'E/S en un mot, pour un message a l'utilisateur.
+pub fn io_reason(e: &io::Error) -> String {
+    match e.kind() {
+        io::ErrorKind::NotFound => "introuvable".to_string(),
+        io::ErrorKind::PermissionDenied => "accès refusé".to_string(),
+        _ => e.to_string(),
+    }
+}
+
+/// Pourquoi `path` n'est pas une entree (`stat_entry_explicit` a rendu `None`) : introuvable, pas un fichier,
+/// illisible, ou contenu sans signature de media connue.
+pub fn reject_reason(path: &Path) -> String {
+    let md = match std::fs::metadata(path) {
+        Ok(md) => md,
+        Err(e) => return io_reason(&e),
+    };
+    if !md.is_file() {
+        return "pas un fichier".to_string();
+    }
+    match media::sniff_path(path) {
+        Ok(_) => "contenu non reconnu comme média".to_string(),
+        Err(e) => format!("illisible ({})", io_reason(&e)),
+    }
 }
 
 /// Insere `entry` a sa place dans une liste triee par `list` ; rend son index.
@@ -462,6 +566,143 @@ mod tests {
         assert!(reconcile(&mut v, &p("IMG_1.MOV")).changed);
         assert_eq!(names(&v), ["IMG_1.HEIC"]);
         assert_eq!(v, list(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn first_is_the_first_entry_of_list() {
+        let scenarios: [(&str, &[&str]); 9] = [
+            ("empty", &[]),
+            ("hidden-and-text", &[".a.jpg", "notes.txt"]),
+            ("plain", &["IMG_10.jpg", "IMG_2.JPG", "clip.mp4"]),
+            // le .mov trie avant son image : il est dans l'entree de l'image, qui vient ensuite
+            ("mov-before-image", &["a.mov", "a.png", "b.jpg"]),
+            ("mov-after-image", &["a.heic", "A.MOV", "b.jpg"]),
+            // deux images de meme stem : le .mov reste une video, et c'est la premiere entree
+            ("ambiguous", &["IMG_1.MOV", "IMG_1.jpg", "IMG_1.png"]),
+            // deux .mov petits : le premier rejoint l'image, le second reste une video
+            ("two-movs", &["a.mov", "a.MOV", "a.png", "b.mov"]),
+            ("only-movs", &["a.mov", "b.mov"]),
+            ("big-mov", &["a.mov", "a.png"]),
+        ];
+        for (name, files) in scenarios {
+            let dir = TmpDir::new(&format!("dir-first-{name}"));
+            for f in files {
+                std::fs::write(dir.path().join(f), b"x").unwrap();
+            }
+            if name == "big-mov" {
+                std::fs::File::options().write(true).open(dir.path().join("a.mov")).unwrap().set_len(LIVE_MOV_MAX).unwrap();
+            }
+            assert_eq!(first_entry(dir.path()), list(dir.path()).unwrap().first().cloned(), "{name}");
+        }
+        // un dossier a extension de media, avant tout fichier : ce n'est pas une entree
+        let dir = TmpDir::new("dir-first-subdir");
+        std::fs::create_dir(dir.path().join("0.jpg")).unwrap();
+        std::fs::write(dir.path().join("1.png"), b"x").unwrap();
+        assert_eq!(names(&[first_entry(dir.path()).unwrap()]), ["1.png"]);
+        assert_eq!(first_entry(dir.path()), list(dir.path()).unwrap().first().cloned());
+        assert!(first(&dir.path().join("absent")).is_err());
+        assert_eq!(first(TmpDir::new("dir-first-empty").path()).unwrap(), First::Empty);
+    }
+
+    /// `first` quand il tranche : l'entree, ou `None` pour un dossier sans media.
+    fn first_entry(dir: &Path) -> Option<Entry> {
+        match first(dir).unwrap() {
+            First::Found(e) => Some(e),
+            First::Empty => None,
+            First::Undecided => panic!("budget de lectures depasse"),
+        }
+    }
+
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        std::fs::read(crate::fixtures_dir().join(name)).unwrap()
+    }
+
+    #[test]
+    fn an_unknown_extension_is_read_by_content() {
+        let dir = TmpDir::new("dir-sniff");
+        let p = |n: &str| dir.path().join(n);
+        std::fs::write(p("T984.ithmb"), fixture_bytes("a.jpg")).unwrap();
+        std::fs::write(p("sans-extension"), fixture_bytes("d.png")).unwrap();
+        std::fs::write(p("clip.bin"), fixture_bytes("j.mov")).unwrap();
+        // texte, base de donnees, ou extension de non-media : jamais ouverts ni listes, meme avec un contenu d'image
+        std::fs::write(p("notes.ithmb2"), b"juste du texte").unwrap();
+        std::fs::write(p("vide.dat"), b"").unwrap();
+        std::fs::write(p("cache.db"), fixture_bytes("a.jpg")).unwrap();
+        std::fs::write(p("Thumbs.txt"), fixture_bytes("a.jpg")).unwrap();
+        std::fs::write(p(".cache"), fixture_bytes("a.jpg")).unwrap();
+        std::fs::create_dir(p("dossier.ithmb")).unwrap();
+        let list = list(dir.path()).unwrap();
+        assert_eq!(names(&list), ["clip.bin", "sans-extension", "T984.ithmb"]);
+        let kinds: Vec<MediaKind> = list.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [MediaKind::Video, MediaKind::Png, MediaKind::Jpeg]);
+        assert_eq!(first_entry(dir.path()), list.first().cloned());
+    }
+
+    #[test]
+    fn a_known_extension_is_trusted_without_opening_the_file() {
+        // le listing ne lit pas le contenu : un PNG nomme .jpg est liste ; c'est `decode` qui tranche par contenu
+        let dir = TmpDir::new("dir-trust");
+        std::fs::write(dir.path().join("a.jpg"), fixture_bytes("d.png")).unwrap();
+        std::fs::write(dir.path().join("b.jpg"), b"du texte").unwrap();
+        let e = list(dir.path()).unwrap();
+        assert_eq!(names(&e), ["a.jpg", "b.jpg"]);
+        assert!(e.iter().all(|e| e.kind == MediaKind::Jpeg));
+    }
+
+    #[test]
+    fn an_unreadable_file_is_ignored_silently() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TmpDir::new("dir-unreadable");
+        let p = |n: &str| dir.path().join(n);
+        std::fs::write(p("a.ithmb"), fixture_bytes("a.jpg")).unwrap();
+        std::fs::write(p("b.ithmb"), fixture_bytes("a.jpg")).unwrap();
+        std::fs::set_permissions(p("a.ithmb"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root lit tout : le test ne prouve rien dans ce cas
+        if std::fs::File::open(p("a.ithmb")).is_err() {
+            assert_eq!(names(&list(dir.path()).unwrap()), ["b.ithmb"]);
+            assert_eq!(first_entry(dir.path()).map(|e| file_name(&e.path)), Some("b.ithmb".to_string()));
+            assert_eq!(stat_entry(&p("a.ithmb")), None);
+            assert_eq!(reject_reason(&p("a.ithmb")), "illisible (accès refusé)");
+        }
+        std::fs::set_permissions(p("a.ithmb"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn first_gives_up_after_its_budget_of_reads() {
+        let dir = TmpDir::new("dir-first-budget");
+        for i in 0..FIRST_SNIFF_BUDGET + 5 {
+            std::fs::write(dir.path().join(format!("f{i:04}.dat")), b"pas un media").unwrap();
+        }
+        std::fs::write(dir.path().join("zz.jpg"), b"x").unwrap();
+        assert_eq!(first(dir.path()).unwrap(), First::Undecided);
+        assert_eq!(names(&list(dir.path()).unwrap()), ["zz.jpg"]);
+        // peu de fichiers inconnus : le premier media est trouve malgre eux
+        let small = TmpDir::new("dir-first-small");
+        std::fs::write(small.path().join("a.dat"), b"pas un media").unwrap();
+        std::fs::write(small.path().join("b.jpg"), b"x").unwrap();
+        assert_eq!(names(&[first_entry(small.path()).unwrap()]), ["b.jpg"]);
+    }
+
+    #[test]
+    fn explicit_files_are_read_by_content_whatever_their_extension() {
+        let dir = TmpDir::new("dir-explicit");
+        let p = |n: &str| dir.path().join(n);
+        std::fs::write(p("photo.txt"), fixture_bytes("a.jpg")).unwrap();
+        std::fs::write(p("vrai.txt"), b"du texte").unwrap();
+        assert_eq!(stat_entry(&p("photo.txt")), None);
+        assert_eq!(stat_entry_explicit(&p("photo.txt")).map(|e| e.kind), Some(MediaKind::Jpeg));
+        assert_eq!(stat_entry_explicit(&p("vrai.txt")), None);
+    }
+
+    #[test]
+    fn reject_reasons_are_distinct() {
+        let dir = TmpDir::new("dir-reject");
+        let p = |n: &str| dir.path().join(n);
+        std::fs::write(p("a.txt"), b"du texte").unwrap();
+        std::fs::create_dir(p("d")).unwrap();
+        assert_eq!(reject_reason(&p("absent.jpg")), "introuvable");
+        assert_eq!(reject_reason(&p("d")), "pas un fichier");
+        assert_eq!(reject_reason(&p("a.txt")), "contenu non reconnu comme média");
     }
 
     #[test]

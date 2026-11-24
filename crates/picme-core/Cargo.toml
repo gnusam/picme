@@ -11,7 +11,7 @@ async-channel = "2.5"
 crc32fast = "1.5"
 fast_image_resize = "6.2"
 # formats limites a ceux que picme-core decode via `image` (JPEG : turbojpeg, HEIC et AVIF : libheif, JXL : jxl-oxide)
-image = { version = "0.25", default-features = false, features = ["png", "tiff", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "webp", "gif", "bmp", "ico", "qoi", "pnm"] }
 jxl-oxide = { version = "0.12", default-features = false }
 kamadak-exif = "0.6"
 # feature de version = minimum utile, pas la derniere : le poste peut avoir une libheif plus ancienne que le conteneur

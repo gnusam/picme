@@ -105,7 +105,14 @@ pub(crate) fn ratio_matches(w: u32, h: u32, full_w: u32, full_h: u32) -> bool {
 pub fn probe_dims(path: &Path) -> Option<(u32, u32)> {
     match media::detect(path)? {
         MediaKind::Jpeg => jpeg::probe(path),
-        kind @ (MediaKind::Png | MediaKind::Webp | MediaKind::Tiff) => raster::probe(path, kind),
+        kind @ (MediaKind::Png
+        | MediaKind::Webp
+        | MediaKind::Tiff
+        | MediaKind::Gif
+        | MediaKind::Bmp
+        | MediaKind::Ico
+        | MediaKind::Qoi
+        | MediaKind::Pnm) => raster::probe(path, kind),
         MediaKind::Heif => heif::probe(path),
         MediaKind::Jxl | MediaKind::Raw | MediaKind::Video => None,
     }
@@ -136,7 +143,16 @@ fn decode_with(path: &Path, target: Target, max_full_bytes: usize, lenient: bool
     }
     match media::detect(path) {
         Some(MediaKind::Jpeg) => jpeg::decode(path, target, max_full_bytes, lenient),
-        Some(kind @ (MediaKind::Png | MediaKind::Webp | MediaKind::Tiff)) => raster::decode(path, kind, target, max_full_bytes),
+        Some(
+            kind @ (MediaKind::Png
+            | MediaKind::Webp
+            | MediaKind::Tiff
+            | MediaKind::Gif
+            | MediaKind::Bmp
+            | MediaKind::Ico
+            | MediaKind::Qoi
+            | MediaKind::Pnm),
+        ) => raster::decode(path, kind, target, max_full_bytes),
         Some(MediaKind::Heif) => heif::decode(path, target, max_full_bytes),
         Some(MediaKind::Jxl) => jxl::decode(path, target, max_full_bytes),
         #[cfg(feature = "raw")]
@@ -346,6 +362,44 @@ mod tests {
             eprintln!("{name} : ecart moyen {d:.2}");
             assert!(d < max_diff, "{name} : ecart moyen {d}");
         }
+    }
+
+    #[test]
+    fn content_picks_the_decoder_whatever_the_name() {
+        use image::ImageFormat as F;
+        let dir = crate::testutil::TmpDir::new("decode-by-content");
+        let mut img = image::RgbImage::new(40, 30);
+        for p in img.pixels_mut() {
+            *p = image::Rgb([230, 20, 20]);
+        }
+        let img = image::DynamicImage::ImageRgb8(img);
+        for (format, kind) in [(F::Gif, MediaKind::Gif), (F::Bmp, MediaKind::Bmp), (F::Ico, MediaKind::Ico), (F::Qoi, MediaKind::Qoi), (F::Pnm, MediaKind::Pnm)] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            // l'encodeur ICO n'ecrit un PNG relisible qu'en RGBA
+            let src = if format == F::Ico { image::DynamicImage::ImageRgba8(img.to_rgba8()) } else { img.clone() };
+            src.write_to(&mut bytes, format).unwrap_or_else(|e| panic!("{format:?} : {e}"));
+            // nom neutre, extension inconnue, extension d'un autre format : le contenu decide
+            for name in [format!("x-{kind:?}.ithmb"), format!("y-{kind:?}.jpg"), format!("z-{kind:?}")] {
+                let p = dir.path().join(&name);
+                std::fs::write(&p, bytes.get_ref()).unwrap();
+                assert_eq!(media::detect(&p), Some(kind), "{name}");
+                let f = decode(&p, Target::Full).unwrap_or_else(|e| panic!("{name} : {e}"));
+                assert_eq!((f.w, f.h), (40, 30), "{name}");
+                assert!(is_red(px(&f, 5, 5)), "{name} : {:?}", px(&f, 5, 5));
+                assert_eq!(probe_dims(&p), Some((40, 30)), "{name}");
+            }
+        }
+        // un PNG et un JPEG sous des noms qui se contredisent
+        for (src, ext) in [("d.png", "jpg"), ("a.jpg", "png"), ("a.jpg", "ithmb"), ("f.webp", "tif")] {
+            let p = dir.path().join(format!("{src}.{ext}"));
+            std::fs::copy(fx(src), &p).unwrap();
+            let f = decode(&p, Target::Preview).unwrap_or_else(|e| panic!("{src} en .{ext} : {e}"));
+            assert_eq!((f.full_w, f.full_h), (640, 480), "{src} en .{ext}");
+        }
+        // du texte sous une extension d'image : une erreur, pas un panic
+        let txt = dir.path().join("texte.jpg");
+        std::fs::write(&txt, b"juste du texte").unwrap();
+        assert!(decode(&txt, Target::Preview).is_err());
     }
 
     #[test]
