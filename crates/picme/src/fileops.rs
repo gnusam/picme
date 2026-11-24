@@ -7,6 +7,11 @@
 //! dans la meme seconde. Les tailles `x-large` et `xx-large`, ecrites par d'autres programmes, ne sont pas touchees
 //! (elles sont ignorees a la lecture des que le mtime differe). La corbeille ne se replie jamais sur une suppression.
 //!
+//! Annulation : Suppr et Maj+Suppr passent toutes deux par la corbeille, et Ctrl+Z remet le dernier retrait a sa place
+//! pendant `UNDO_WINDOW`. Maj+Suppr vide ensuite la corbeille de ce qu'il a retire (a l'expiration, ou a l'arret du
+//! thread : quitter rend la suppression definitive). Sur un systeme de fichiers sans corbeille, Maj+Suppr supprime
+//! tout de suite, sans annulation possible.
+//!
 //! Les ecritures de miniatures sont facultatives : au-dela de `MAX_THUMB_BACKLOG` en attente, les suivantes sont
 //! jetees (elles seront refaites a la prochaine ouverture) pour ne pas retenir des frames en memoire pendant un
 //! defilement rapide. Une miniature dont le fichier a change depuis le decode (rotation passee avant elle) est jetee.
@@ -19,14 +24,19 @@ use picme_core::edit::rotate::{self, Saved};
 use picme_core::error::{Error, Result};
 use picme_core::orient::Orientation;
 use picme_core::thumbs::ThumbStore;
+use crate::trashbin::{self, Trashed};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub const MAX_THUMB_BACKLOG: usize = 16;
+
+/// Delai pendant lequel Ctrl+Z remet un fichier retire.
+pub const UNDO_WINDOW: Duration = Duration::from_secs(30);
 
 /// Mise a la corbeille d'un fichier : [`gio_trash`] dans l'application, remplacable dans les tests.
 pub type TrashFn = Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>;
@@ -36,6 +46,14 @@ enum Op {
     Crop { path: PathBuf, rect: Frac, replace: bool },
     Trash { paths: Vec<PathBuf> },
     Delete { paths: Vec<PathBuf> },
+    Undo,
+}
+
+/// Un retrait annulable : ce qui est a la corbeille, et s'il faut l'y vider a l'expiration (Maj+Suppr).
+struct Undo {
+    items: Vec<Trashed>,
+    purge: bool,
+    deadline: Instant,
 }
 
 enum Msg {
@@ -53,11 +71,22 @@ pub enum Done {
     Cropped { path: PathBuf, result: Result<Cropped> },
     /// `paths` : tout ce qui etait demande (l'image puis son `.mov`) ; `error` : le premier echec, apres lequel rien
     /// n'a ete tente.
-    Removed { paths: Vec<PathBuf>, trash: bool, error: Option<(PathBuf, Error)> },
+    /// `undo` : Ctrl+Z peut encore le remettre.
+    Removed { paths: Vec<PathBuf>, trash: bool, undo: bool, error: Option<(PathBuf, Error)> },
+    /// Ctrl+Z : `paths` remis a leur place (vide : rien a annuler) ; `error` : le premier echec.
+    Restored { paths: Vec<PathBuf>, error: Option<(PathBuf, Error)> },
 }
 
 fn name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Le nom d'un retrait : l'image, et son `.mov` s'il y en a un.
+fn what(paths: &[PathBuf]) -> String {
+    match paths {
+        [img, _mov] => format!("{} et son .mov", name(img)),
+        _ => paths.first().map(|p| name(p)).unwrap_or_default(),
+    }
 }
 
 impl Done {
@@ -66,7 +95,7 @@ impl Done {
         match self {
             Done::Rotated { result, .. } => result.is_ok(),
             Done::Cropped { result, .. } => result.is_ok(),
-            Done::Removed { error, .. } => error.is_none(),
+            Done::Removed { error, .. } | Done::Restored { error, .. } => error.is_none(),
         }
     }
 
@@ -82,13 +111,14 @@ impl Done {
                 format!("copie recadrée : {}{}", name(&c.path), if c.lossless { "" } else { " (JPEG ré-encodé)" })
             }
             Done::Cropped { path, result: Err(e) } => format!("recadrage impossible : {} : {e}", name(path)),
-            Done::Removed { paths, trash, error: None } => {
-                let what = match paths.as_slice() {
-                    [img, _mov] => format!("{} et son .mov", name(img)),
-                    _ => paths.first().map(|p| name(p)).unwrap_or_default(),
-                };
-                if *trash { format!("{what} à la corbeille") } else { format!("{what} supprimé") }
+            Done::Removed { paths, trash, undo, error: None } => {
+                let what = what(paths);
+                let hint = if *undo { " (Ctrl+Z annule)" } else { "" };
+                if *trash { format!("{what} à la corbeille{hint}") } else { format!("{what} supprimé{hint}") }
             }
+            Done::Restored { paths, error: None } if paths.is_empty() => "rien à annuler".into(),
+            Done::Restored { paths, error: None } => format!("{} remis en place", what(paths)),
+            Done::Restored { error: Some((p, e)), .. } => format!("annulation impossible : {} : {e}", name(p)),
             Done::Removed { trash, error: Some((p, e)), .. } => {
                 format!("{} impossible : {} : {e}", if *trash { "corbeille" } else { "suppression" }, name(p))
             }
@@ -143,9 +173,14 @@ impl FileOpsHandle {
         self.send(Op::Trash { paths })
     }
 
-    /// Supprime `paths` definitivement, dans l'ordre, en s'arretant au premier echec.
+    /// Supprime `paths`, dans l'ordre, en s'arretant au premier echec : par la corbeille, videe apres `UNDO_WINDOW`.
     pub fn delete(&self, paths: Vec<PathBuf>) -> bool {
         self.send(Op::Delete { paths })
+    }
+
+    /// Ctrl+Z : remet a sa place le dernier retrait encore dans `UNDO_WINDOW`.
+    pub fn undo(&self) -> bool {
+        self.send(Op::Undo)
     }
 
     fn send(&self, op: Op) -> bool {
@@ -167,14 +202,31 @@ impl FileOps {
 
     /// [`FileOps::new`] avec une autre corbeille (tests).
     pub fn with_trash(thumbs: Option<ThumbStore>, done: async_channel::Sender<Done>, trash: TrashFn) -> Self {
+        Self::with_trash_and_window(thumbs, done, trash, UNDO_WINDOW)
+    }
+
+    /// [`FileOps::new`] avec un autre delai d'annulation (tests).
+    pub fn with_window(thumbs: Option<ThumbStore>, done: async_channel::Sender<Done>, window: Duration) -> Self {
+        Self::with_trash_and_window(thumbs, done, Arc::new(gio_trash), window)
+    }
+
+    fn with_trash_and_window(thumbs: Option<ThumbStore>, done: async_channel::Sender<Done>, trash: TrashFn, window: Duration) -> Self {
         let (tx, rx) = mpsc::channel::<Msg>();
         let thumbs_pending = Arc::new(AtomicUsize::new(0));
         let pending = thumbs_pending.clone();
         let thread = std::thread::Builder::new()
             .name("picme-fileops".into())
             .spawn(move || {
+                let mut undo: Vec<Undo> = Vec::new();
                 loop {
-                    match rx.recv() {
+                    expire(&mut undo);
+                    // la plus ancienne echeance est en tete : les delais sont tous les memes
+                    let msg = match undo.first() {
+                        None => rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                        Some(u) => rx.recv_timeout(u.deadline.saturating_duration_since(Instant::now())),
+                    };
+                    match msg {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Ok(Msg::StoreThumb { entry, frame }) => {
                             let fresh = dir::stat_entry(&entry.path).is_some_and(|e| (e.mtime_ns, e.size) == (entry.mtime_ns, entry.size));
                             if let Some(store) = &thumbs
@@ -189,14 +241,18 @@ impl FileOps {
                             // une panique dans une operation ne doit pas tuer le thread : les suivantes (et leur
                             // compte rendu, que le main thread attend) passeraient sous silence
                             let failed = failure(&op);
-                            let result = catch_unwind(AssertUnwindSafe(|| run(op, thumbs.as_ref(), &*trash)));
+                            let result = catch_unwind(AssertUnwindSafe(|| run(op, thumbs.as_ref(), &*trash, &mut undo, window)));
                             let _ = done.send_blocking(result.unwrap_or_else(|p| {
                                 let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
                                 failed(Error::Io(std::io::Error::other(format!("panique : {}", msg.unwrap_or_default()))))
                             }));
                         }
-                        Ok(Msg::Stop) | Err(_) => break,
+                        Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
+                }
+                // quitter rend definitif ce que Maj+Suppr avait retire
+                for u in undo.drain(..) {
+                    finish(u);
                 }
             })
             .expect("thread fileops");
@@ -241,14 +297,35 @@ fn failure(op: &Op) -> Box<dyn FnOnce(Error) -> Done> {
             let (paths, trash) = (paths.clone(), matches!(op, Op::Trash { .. }));
             Box::new(move |e| {
                 let first = paths.first().cloned().unwrap_or_default();
-                Done::Removed { paths, trash, error: Some((first, e)) }
+                Done::Removed { paths, trash, undo: false, error: Some((first, e)) }
             })
+        }
+        Op::Undo => Box::new(|e| Done::Restored { paths: Vec::new(), error: Some((PathBuf::new(), e)) }),
+    }
+}
+
+/// Vide la corbeille de ce que Maj+Suppr y avait mis, quand son delai est fini.
+fn finish(u: Undo) {
+    if u.purge {
+        for t in &u.items {
+            if let Err(e) = trashbin::purge(t) {
+                eprintln!("picme : corbeille : {} : {e}", t.orig.display());
+            }
         }
     }
 }
 
+/// Les retraits dont le delai est passe ne sont plus annulables.
+fn expire(undo: &mut Vec<Undo>) {
+    let now = Instant::now();
+    let keep = undo.iter().position(|u| u.deadline > now).unwrap_or(undo.len());
+    for u in undo.drain(..keep) {
+        finish(u);
+    }
+}
+
 /// Une operation sur les fichiers, puis l'effacement des miniatures `normal` et `large` de ce qui a change.
-fn run(op: Op, thumbs: Option<&ThumbStore>, trash: &dyn Fn(&Path) -> Result<()>) -> Done {
+fn run(op: Op, thumbs: Option<&ThumbStore>, trash: &dyn Fn(&Path) -> Result<()>, undo: &mut Vec<Undo>, window: Duration) -> Done {
     let forget = |p: &Path| {
         if let Some(store) = thumbs {
             store.forget(p);
@@ -271,21 +348,53 @@ fn run(op: Op, thumbs: Option<&ThumbStore>, trash: &dyn Fn(&Path) -> Result<()>)
             }
             Done::Cropped { path, result }
         }
-        Op::Trash { paths } => remove(paths, true, trash, forget),
-        Op::Delete { paths } => remove(paths, false, &gio_delete, forget),
+        Op::Trash { paths } => remove(paths, false, trash, forget, undo, window),
+        Op::Delete { paths } => remove(paths, true, trash, forget, undo, window),
+        Op::Undo => restore(undo),
     }
 }
 
-fn remove(paths: Vec<PathBuf>, trash: bool, op: &dyn Fn(&Path) -> Result<()>, forget: impl Fn(&Path)) -> Done {
+/// `purge` : Maj+Suppr, qui vide la corbeille a l'expiration et se replie sur une suppression immediate si le
+/// systeme de fichiers n'a pas de corbeille ; Suppr n'a jamais ce repli.
+fn remove(paths: Vec<PathBuf>, purge: bool, trash: &dyn Fn(&Path) -> Result<()>, forget: impl Fn(&Path), undo: &mut Vec<Undo>, window: Duration) -> Done {
     let mut error = None;
+    let mut items = Vec::new();
     for p in &paths {
-        if let Err(e) = op(p) {
-            error = Some((p.clone(), e));
-            break;
+        match trash(p) {
+            Ok(()) => items.extend(trashbin::locate(p)),
+            Err(_) if purge => {
+                if let Err(e) = gio_delete(p) {
+                    error = Some((p.clone(), e));
+                    break;
+                }
+            }
+            Err(e) => {
+                error = Some((p.clone(), e));
+                break;
+            }
         }
         forget(p);
     }
-    Done::Removed { paths, trash, error }
+    let undoable = !items.is_empty();
+    if undoable {
+        undo.push(Undo { items, purge, deadline: Instant::now() + window });
+    }
+    Done::Removed { paths, trash: !purge, undo: undoable, error }
+}
+
+/// Ctrl+Z : remet a sa place le retrait le plus recent. Ce qui n'a pas pu l'etre reste a la corbeille.
+fn restore(undo: &mut Vec<Undo>) -> Done {
+    let Some(u) = undo.pop() else { return Done::Restored { paths: Vec::new(), error: None } };
+    let (mut paths, mut error) = (Vec::new(), None);
+    for t in &u.items {
+        match trashbin::restore(t) {
+            Ok(()) => paths.push(t.orig.clone()),
+            Err(e) => {
+                error.get_or_insert((t.orig.clone(), Error::Io(e)));
+            }
+        }
+    }
+    Done::Restored { paths, error }
 }
 
 #[cfg(test)]
@@ -431,7 +540,7 @@ mod tests {
     #[test]
     fn delete_removes_for_good_in_order_and_stops_at_the_first_failure() {
         let tmp = TmpDir::new("fileops-delete");
-        let (ops, rx, store, seen) = rig(&tmp, "");
+        let (ops, rx, store, _) = rig(&tmp, "");
         let e = entry(&tmp, 0);
         with_thumbs(&store, &e);
         let mov = tmp.path().join("000.mov");
@@ -440,7 +549,6 @@ mod tests {
         let done = rx.recv_blocking().unwrap();
         assert!(done.ok(), "{done:?}");
         assert!(!e.path.exists() && !mov.exists());
-        assert!(seen.lock().unwrap().is_empty(), "pas par la corbeille");
         assert!(!store.path_of(&e, ThumbSize::Large).exists() && !store.path_of(&e, ThumbSize::Normal).exists());
 
         let gone = tmp.path().join("absent.jpg");
@@ -494,7 +602,7 @@ mod tests {
         assert!(ops.handle().trash(vec![boom.clone(), mov.clone()]));
         let done = rx.recv_blocking().unwrap();
         assert!(!done.ok(), "{done:?}");
-        assert!(matches!(&done, Done::Removed { trash: true, paths, error: Some((p, _)) } if *p == boom && paths.len() == 2), "{done:?}");
+        assert!(matches!(&done, Done::Removed { trash: true, paths, error: Some((p, _)), .. } if *p == boom && paths.len() == 2), "{done:?}");
         assert!(done.message().contains("corbeille en panne"), "{}", done.message());
         assert!(boom.exists() && mov.exists());
 

@@ -23,8 +23,10 @@ pub enum Action {
     TurnLeft,
     /// Suppr : le courant (et le `.mov` d'une Live Photo) a la corbeille.
     Trash,
-    /// Maj+Suppr : suppression definitive, sans confirmation.
+    /// Maj+Suppr : suppression, definitive au bout de 30 s sans Ctrl+Z.
     Delete,
+    /// Ctrl+Z : remet le dernier fichier retire, tant que les 30 s ne sont pas passees.
+    Undo,
     Fullscreen,
     /// O : ouvre le dossier courant dans le gestionnaire de fichiers du systeme.
     OpenFolder,
@@ -80,6 +82,7 @@ pub fn action(key: Key, state: ModifierType, ctx: Ctx) -> Option<Action> {
         return match key {
             Key::Right => Some(Action::RotateRight),
             Key::Left => Some(Action::RotateLeft),
+            _ if key.to_lower() == Key::z && !shift => Some(Action::Undo),
             _ => None,
         };
     }
@@ -180,6 +183,9 @@ mod tests {
         assert_eq!(action(Key::KP_Delete, NONE), Some(Action::Trash));
         assert_eq!(action(Key::Delete, shift), Some(Action::Delete));
         assert_eq!(action(Key::Delete, ModifierType::CONTROL_MASK), None);
+        assert_eq!(action(Key::z, ModifierType::CONTROL_MASK), Some(Action::Undo));
+        assert_eq!(action(Key::Z, ModifierType::CONTROL_MASK | shift), None, "Ctrl+Maj+Z : pas de retablir");
+        assert_eq!(action(Key::z, NONE), None);
         assert_eq!(action(Key::r, ModifierType::CONTROL_MASK), None);
     }
 

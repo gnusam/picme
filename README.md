@@ -58,7 +58,8 @@ flowchart TB
 | Ctrl+Droite, Ctrl+Gauche | tourne la vue seulement, le fichier ne change pas |
 | C | recadrage interactif (voir plus bas) |
 | Suppr | envoie l'image (et le `.mov` d'une Live Photo) à la corbeille |
-| Maj+Suppr | supprime définitivement |
+| Maj+Suppr | supprime : l'image passe par la corbeille, qui en est vidée au bout de 30 s (ou en quittant) ; sur un filesystem sans corbeille, suppression immédiate |
+| Ctrl+Z | remet à sa place le dernier fichier retiré par Suppr ou Maj+Suppr, dans les 30 s |
 | Maj+Droite, Maj+Gauche | sur une vidéo, saute de 5 secondes |
 | M | son de la vidéo (coupé par défaut) |
 | L | tenue : joue la vidéo d'une Live Photo |

@@ -6,12 +6,15 @@ use gtk4::glib;
 use picme::fileops::{Done, FileOps};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::Duration;
+
+const WINDOW: Duration = Duration::from_millis(1500);
 
 fn removed(rx: &async_channel::Receiver<Done>) -> (Vec<std::path::PathBuf>, bool, Option<String>, String) {
     let done = rx.recv_blocking().expect("compte rendu");
     let msg = done.message();
     match done {
-        Done::Removed { paths, trash, error } => (paths, trash, error.map(|(p, e)| format!("{} : {e}", p.display())), msg),
+        Done::Removed { paths, trash, error, .. } => (paths, trash, error.map(|(p, e)| format!("{} : {e}", p.display())), msg),
         other => panic!("attendu Removed, recu {other:?}"),
     }
 }
@@ -35,7 +38,7 @@ fn trash_and_delete_go_through_gio_into_a_private_trash() {
     assert_eq!(std::fs::metadata(&photos).unwrap().dev(), std::fs::metadata(&home).unwrap().dev());
 
     let (tx, rx) = async_channel::unbounded();
-    let ops = FileOps::new(None, tx);
+    let ops = FileOps::with_window(None, tx, WINDOW);
     let h = ops.handle();
 
     // Suppr sur une Live Photo : l'image puis son .mov, chacun avec son .trashinfo
@@ -45,7 +48,7 @@ fn trash_and_delete_go_through_gio_into_a_private_trash() {
     assert!(h.trash(vec![img.clone(), mov.clone()]));
     let (paths, trash, error, msg) = removed(&rx);
     assert_eq!((paths, trash, error), (vec![img.clone(), mov.clone()], true, None));
-    assert_eq!(msg, "IMG_1.HEIC et son .mov à la corbeille");
+    assert_eq!(msg, "IMG_1.HEIC et son .mov à la corbeille (Ctrl+Z annule)");
     let bin = data.join("Trash");
     for (p, content) in [(&img, "image"), (&mov, "video")] {
         let name = p.file_name().unwrap().to_str().unwrap();
@@ -57,13 +60,55 @@ fn trash_and_delete_go_through_gio_into_a_private_trash() {
         assert!(info.lines().any(|l| l.starts_with("DeletionDate=")), "{info}");
     }
 
-    // Maj+Suppr : definitif, rien dans la corbeille
+    // Ctrl+Z : l'image et son .mov reviennent, la corbeille est vide de leurs fiches
+    assert!(h.undo());
+    match rx.recv_blocking().unwrap() {
+        Done::Restored { paths, error: None } => assert_eq!(paths, vec![img.clone(), mov.clone()]),
+        other => panic!("attendu Restored, recu {other:?}"),
+    }
+    assert_eq!((std::fs::read_to_string(&img).unwrap(), std::fs::read_to_string(&mov).unwrap()), ("image".into(), "video".into()));
+    assert!(!bin.join("files/IMG_1.HEIC").exists() && !bin.join("info/IMG_1.HEIC.trashinfo").exists());
+    // rien d'autre a annuler
+    assert!(h.undo());
+    let done = rx.recv_blocking().unwrap();
+    assert_eq!(done.message(), "rien à annuler");
+
+    // Maj+Suppr : a la corbeille tout de suite, videe a l'expiration
     let jpg = photos.join("b.jpg");
     std::fs::write(&jpg, b"x").unwrap();
     assert!(h.delete(vec![jpg.clone()]));
     let (_, trash, error, msg) = removed(&rx);
-    assert_eq!((trash, error, msg.as_str()), (false, None, "b.jpg supprimé"));
-    assert!(!jpg.exists() && !bin.join("files/b.jpg").exists());
+    assert_eq!((trash, error, msg.as_str()), (false, None, "b.jpg supprimé (Ctrl+Z annule)"));
+    assert!(!jpg.exists() && bin.join("files/b.jpg").exists(), "encore recuperable");
+    std::thread::sleep(WINDOW + Duration::from_millis(700));
+    assert!(!bin.join("files/b.jpg").exists() && !bin.join("info/b.jpg.trashinfo").exists(), "definitif apres le delai");
+    assert!(h.undo());
+    assert_eq!(rx.recv_blocking().unwrap().message(), "rien à annuler");
+    assert!(!jpg.exists());
+
+    // Maj+Suppr puis Ctrl+Z dans le delai : le fichier revient
+    std::fs::write(&jpg, b"y").unwrap();
+    assert!(h.delete(vec![jpg.clone()]));
+    removed(&rx);
+    assert!(h.undo());
+    assert!(matches!(rx.recv_blocking().unwrap(), Done::Restored { error: None, .. }));
+    assert_eq!(std::fs::read_to_string(&jpg).unwrap(), "y");
+
+    // un autre fichier a pris le nom : pas d'ecrasement, l'original reste a la corbeille
+    assert!(h.trash(vec![jpg.clone()]));
+    removed(&rx);
+    std::fs::write(&jpg, b"z").unwrap();
+    assert!(h.undo());
+    let done = rx.recv_blocking().unwrap();
+    assert!(!done.ok() && done.message().starts_with("annulation impossible : b.jpg"), "{}", done.message());
+    assert_eq!(std::fs::read_to_string(&jpg).unwrap(), "z");
+
+    // Maj+Suppr puis quitter dans le delai : la corbeille est videe
+    let last = photos.join("c.jpg");
+    std::fs::write(&last, b"c").unwrap();
+    assert!(h.delete(vec![last.clone()]));
+    removed(&rx);
+    assert!(bin.join("files/c.jpg").exists());
 
     // fichier deja parti : l'erreur remonte, rien d'autre n'est tente
     let gone = photos.join("parti.jpg");
@@ -76,6 +121,7 @@ fn trash_and_delete_go_through_gio_into_a_private_trash() {
     assert!(after.exists() && !bin.join("files/apres.jpg").exists());
 
     ops.finish();
+    assert!(!bin.join("files/c.jpg").exists(), "quitter rend la suppression definitive");
     // aucune corbeille de secours a cote des photos
     let stray: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with(".Trash")).collect();
     assert!(stray.is_empty(), "{stray:?}");

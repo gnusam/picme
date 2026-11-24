@@ -12,6 +12,7 @@ pub mod keys;
 pub mod launch;
 pub mod monitor;
 pub mod osd;
+pub mod trashbin;
 pub mod video;
 pub mod view;
 

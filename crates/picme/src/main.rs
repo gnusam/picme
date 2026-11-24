@@ -420,7 +420,7 @@ impl Ui {
         }
     }
 
-    /// Suppr (corbeille) et Maj+Suppr (definitif) : le courant quitte la liste tout de suite, le disque suit.
+    /// Suppr (corbeille) et Maj+Suppr (corbeille videe apres 30 s) : le courant quitte la liste tout de suite, le disque suit.
     fn remove(self: &Rc<Self>, trash: bool) {
         // le fichier est relache avant la corbeille
         self.stop_player();
@@ -433,6 +433,13 @@ impl Ui {
                 self.apply(show);
             }
             self.osd.message("fichier conservé : écritures arrêtées");
+        }
+    }
+
+    /// Ctrl+Z : le dernier retrait encore dans ses 30 s revient ; la liste suit le compte rendu.
+    fn undo(self: &Rc<Self>) {
+        if !self.fileops.undo() {
+            self.osd.message("annulation impossible : écritures arrêtées");
         }
     }
 
@@ -463,6 +470,17 @@ impl Ui {
                     self.apply(show);
                 }
                 paths.clone()
+            }
+            Done::Restored { paths, .. } => {
+                for path in paths {
+                    let show = self.ctl.borrow_mut().reconcile(path);
+                    self.apply(show);
+                }
+                // on revient sur ce qui vient d'etre remis
+                if let Some(first) = paths.first() {
+                    self.open_path(first);
+                }
+                Vec::new()
             }
         };
         if current.is_some_and(|c| touched.contains(&c)) {
@@ -559,6 +577,7 @@ impl Ui {
             Action::Help => self.help.toggle(),
             Action::Trash => self.remove(true),
             Action::Delete => self.remove(false),
+            Action::Undo => self.undo(),
             Action::Fullscreen => {
                 if self.window.is_fullscreen() {
                     self.window.unfullscreen();
@@ -1012,7 +1031,7 @@ fn main() {
             }
             let Some(action) = keys::action(key, state, ui.ctx()) else { return glib::Propagation::Proceed };
             // Suppr maintenue : une seule fois, jusqu'au relachement
-            if matches!(action, Action::Trash | Action::Delete) {
+            if matches!(action, Action::Trash | Action::Delete | Action::Undo) {
                 if ui.delete_held.get().is_some() {
                     return glib::Propagation::Stop;
                 }
