@@ -343,6 +343,11 @@ impl Ui {
         };
         self.anim_want.set(key.clone());
         self.anim_pool.retain(|k| Some(k) == key.as_ref());
+        // `anim_tried` ne vaut que le temps de l'affichage : un autre fichier a l'ecran (ou aucun) l'efface, pour que
+        // le retour sur le GIF relance son animation
+        if self.anim_tried.borrow().as_ref() != key.as_ref() {
+            self.anim_tried.borrow_mut().take();
+        }
         let Some(key) = key else { return };
         if self.anim.borrow().is_some() || self.anim_tried.borrow().as_ref() == Some(&key) {
             return;
