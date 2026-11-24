@@ -63,6 +63,7 @@ flowchart TB
 | M | son de la vidéo (coupé par défaut) |
 | L | tenue : joue la vidéo d'une Live Photo |
 | F11 | plein écran |
+| O | ouvre le dossier courant dans le gestionnaire de fichiers du système |
 | Q, Échap | quitter (Échap annule d'abord un recadrage) |
 
 À la souris : la molette change d'image, Ctrl+molette zoome autour du curseur, le double-clic bascule le zoom, le glisser déplace l'image quand elle dépasse la fenêtre.

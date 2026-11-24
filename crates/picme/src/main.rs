@@ -125,6 +125,16 @@ fn spawn_scan(dir: PathBuf, tx: async_channel::Sender<ScanResult>) {
 }
 
 impl Ui {
+    /// O : le dossier courant dans le gestionnaire de fichiers du systeme (handler `inode/directory`).
+    fn open_folder(&self) {
+        let Some(dir) = self.ctl.borrow().dir().map(Path::to_path_buf) else { return };
+        let uri = gtk4::gio::File::for_path(&dir).uri();
+        match gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
+            Ok(()) => self.osd.message("dossier ouvert"),
+            Err(e) => self.osd.message(&format!("explorateur indisponible : {e}")),
+        }
+    }
+
     fn apply(self: &Rc<Self>, show: Show<gdk::Texture>) {
         match show {
             Show::Keep => {}
@@ -542,6 +552,7 @@ impl Ui {
             Action::RotateLeft => self.canvas.rotate(-1),
             Action::TurnRight => self.turn(1),
             Action::TurnLeft => self.turn(-1),
+            Action::OpenFolder => self.open_folder(),
             Action::Trash => self.remove(true),
             Action::Delete => self.remove(false),
             Action::Fullscreen => {
