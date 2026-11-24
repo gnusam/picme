@@ -79,7 +79,7 @@ Ce que picme fait et ne fait pas, face aux visionneuses courantes sous Linux. Re
 | GIF animé | non | non | oui | oui | oui | oui | n.t. | oui |
 | Diaporama | non | oui | oui | oui | oui | n.t. | oui | oui |
 | Panneau EXIF | oui | partiel | partiel | non | oui | oui | oui | oui |
-| Carte des coordonnées GPS | oui, carte de tout le dossier, dans le navigateur | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. |
+| Carte des coordonnées GPS | oui, carte de tout le dossier, dans le navigateur (page servie sur 127.0.0.1 le temps de la consultation) | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. |
 
 Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, la corbeille avec annulation et les opérations sans perte sur les fichiers, dans une fenêtre qui se pilote au clavier. En contrepartie, il n'a ni Wayland natif, ni GIF animé, ni diaporama. Si tu cherches un outil minimal pour un window manager X11, feh et nsxiv font moins de choses et le font très bien ; si tu veux tout cela dans une application de bureau complète, regarde Gwenview.
 
@@ -105,7 +105,7 @@ Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, 
 | ?, F1 | aide : la liste des raccourcis par-dessus l'image, une touche la ferme |
 | O | ouvre le dossier courant dans le gestionnaire de fichiers du système |
 | I | informations de l'image par-dessus l'image, une touche les ferme : nom, taille, dimensions, date de prise de vue, appareil, objectif, focale, ouverture, temps de pose, ISO et position GPS, quand le fichier les porte |
-| G | carte des photos géolocalisées du dossier (de tout l'arbre avec `-r`) : une page HTML écrite dans `$XDG_CACHE_HOME/picme/` que le navigateur par défaut ouvre, avec un marqueur par photo et l'image affichée au centre ; Leaflet et les tuiles OpenStreetMap sont chargés par le navigateur, picme ne fait aucun appel réseau |
+| G | carte des photos géolocalisées du dossier (de tout l'arbre avec `-r`) : une page HTML que le navigateur par défaut ouvre, avec un marqueur par photo et l'image affichée au centre ; elle est servie en local sur 127.0.0.1 (port éphémère, rien d'écrit sur le disque) le temps de la consultation, pour que les tuiles OpenStreetMap acceptent la requête, et le serveur s'arrête 10 minutes après la dernière consultation ; Leaflet et les tuiles sont chargés par le navigateur, picme ne fait aucun appel réseau vers l'extérieur |
 | Q, Échap | quitter (Échap annule d'abord un recadrage) |
 
 À la souris : la molette change d'image, Ctrl+molette zoome autour du curseur, le double-clic bascule le zoom, le glisser déplace l'image quand elle dépasse la fenêtre.

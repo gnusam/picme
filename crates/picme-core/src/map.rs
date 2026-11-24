@@ -1,12 +1,11 @@
-//! Carte du dossier (touche G) : une page HTML autonome, ecrite dans le cache, que le navigateur ouvre. Leaflet et les
-//! tuiles OpenStreetMap viennent du navigateur ; picme ne fait aucun appel reseau. Les noms de fichiers arrivent dans
-//! la page comme chaines JavaScript echappees et sont poses dans la fenetre d'information par `textContent` : un nom
-//! ne peut ni fermer le `<script>` ni injecter de code.
+//! Carte du dossier (touche G) : une page HTML autonome, servie en local par `serve` (sur `127.0.0.1`, pour que les
+//! tuiles OpenStreetMap recoivent un Referer) et que le navigateur ouvre. Leaflet et les tuiles viennent du navigateur ;
+//! picme ne fait aucun appel reseau. Les noms de fichiers arrivent dans la page comme chaines JavaScript echappees et
+//! sont poses dans la fenetre d'information par `textContent` : un nom ne peut ni fermer le `<script>` ni injecter de
+//! code.
 
 use crate::dir::Entry;
-use md5::{Digest, Md5};
 use std::fmt::Write as _;
-use std::io;
 use std::path::{Path, PathBuf};
 
 /// Modele de la page : `@@TITLE@@`, `@@POINTS@@` et `@@CURRENT@@` sont remplaces par `page`. Les empreintes SRI sont
@@ -119,33 +118,15 @@ pub fn page(points: &[(PathBuf, f64, f64)], current: Option<&Path>, title: &str)
         .replace("@@CURRENT@@", &here.map_or(-1, |i| i as i64).to_string())
 }
 
-/// Chemin de la page du dossier `dir` dans `cache_home` : stable, une page par dossier, remplacee a chaque G.
-pub fn page_path(cache_home: &Path, dir: &Path) -> PathBuf {
-    let digest = Md5::digest(dir.as_os_str().as_encoded_bytes());
-    let mut name = String::from("map-");
-    for b in digest.iter().take(8) {
-        let _ = write!(name, "{b:02x}");
-    }
-    name.push_str(".html");
-    cache_home.join("picme").join(name)
-}
-
-/// Lit la position de chaque image de `entries`, ecrit la page de la carte dans `cache_home/picme/` (remplacee d'un
-/// coup par un rename : un navigateur qui la lit ne voit jamais la moitie d'une page) et rend son chemin. `None` si
-/// aucune image n'est geolocalisee. A appeler hors du thread d'interface.
-pub fn make(entries: &[Entry], current: Option<&Path>, dir: &Path, cache_home: &Path) -> io::Result<Option<PathBuf>> {
+/// Lit la position de chaque image de `entries` et rend la page de la carte, que `serve::Server` sert au navigateur
+/// (rien n'est ecrit sur le disque). `None` si aucune image n'est geolocalisee. A appeler hors du thread d'interface.
+pub fn make(entries: &[Entry], current: Option<&Path>, dir: &Path) -> Option<String> {
     let points = crate::meta::gps_of_entries(entries);
     if points.is_empty() {
-        return Ok(None);
+        return None;
     }
     let title = format!("picme : {}", dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy());
-    let html = page(&points, current, &title);
-    let path = page_path(cache_home, dir);
-    std::fs::create_dir_all(path.parent().expect("sous picme/"))?;
-    let tmp = path.with_extension("html.tmp");
-    std::fs::write(&tmp, html)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(Some(path))
+    Some(page(&points, current, &title))
 }
 
 #[cfg(test)]
@@ -222,19 +203,8 @@ mod tests {
     }
 
     #[test]
-    fn page_path_is_stable_per_directory_and_distinct_between_directories() {
-        let cache = Path::new("/home/u/.cache");
-        let a = page_path(cache, Path::new("/photos/2024"));
-        assert_eq!(a, page_path(cache, Path::new("/photos/2024")));
-        assert_ne!(a, page_path(cache, Path::new("/photos/2025")));
-        assert_eq!(a.parent(), Some(Path::new("/home/u/.cache/picme")));
-        assert!(a.file_name().unwrap().to_string_lossy().starts_with("map-"));
-    }
-
-    #[test]
-    fn make_writes_the_page_replaces_it_and_reports_a_folder_without_position() {
+    fn make_builds_the_page_and_reports_a_folder_without_position() {
         let dir = TmpDir::new("map-make-src");
-        let cache = TmpDir::new("map-make-cache");
         let with = |name: &str, lat: (u32, u32, u32, &'static str)| {
             let p = dir.path().join(name);
             std::fs::write(&p, jpeg_with(&tiff(&[], &[], &gps_tags(lat, (2, 0, 0, "E"), None)))).unwrap();
@@ -245,20 +215,15 @@ mod tests {
             std::fs::copy(crate::fixtures_dir().join("a.jpg"), &p).unwrap();
             Entry { path: p, kind: MediaKind::Jpeg, live_mov: None, mtime_ns: 0, size: 0 }
         };
-        // un dossier sans position : rien d'ecrit
-        assert_eq!(make(std::slice::from_ref(&plain), None, dir.path(), cache.path()).unwrap(), None);
-        assert!(!cache.path().join("picme").exists());
+        // un dossier sans position : pas de page
+        assert_eq!(make(std::slice::from_ref(&plain), None, dir.path()), None);
         let (a, b) = (with("a.jpg", (10, 0, 0, "N")), with("b.jpg", (20, 0, 0, "S")));
         let entries = [a.clone(), plain, b];
-        let path = make(&entries, Some(&a.path), dir.path(), cache.path()).unwrap().unwrap();
-        assert_eq!(path, page_path(cache.path(), dir.path()));
-        let html = std::fs::read_to_string(&path).unwrap();
+        let html = make(&entries, Some(&a.path), dir.path()).unwrap();
         assert!(html.contains("\"a.jpg\", 10.000000, 2.000000") && html.contains("\"b.jpg\", -20.000000, 2.000000"), "{html}");
         assert!(!html.contains("plain.jpg") && html.contains("const HERE = 0;"));
-        // une seconde fois : la meme page, remplacee, sans reste du rename
-        let again = make(&entries, Some(&entries[2].path), dir.path(), cache.path()).unwrap().unwrap();
-        assert_eq!(again, path);
-        assert!(std::fs::read_to_string(&path).unwrap().contains("const HERE = 1;"));
-        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert!(html.contains(&format!("<title>picme : {}</title>", dir.path().file_name().unwrap().to_string_lossy())));
+        // une seconde fois, un autre courant
+        assert!(make(&entries, Some(&entries[2].path), dir.path()).unwrap().contains("const HERE = 1;"));
     }
 }

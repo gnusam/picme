@@ -23,7 +23,8 @@ use picme_core::media::MediaKind;
 use picme_core::meta;
 use picme_core::orient::Orientation;
 use picme_core::pool::{self, Key, Pool};
-use picme_core::thumbs::{self, ThumbStore};
+use picme_core::serve;
+use picme_core::thumbs::ThumbStore;
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -99,6 +100,9 @@ struct Ui {
     /// La page de la carte (G) est en preparation sur un autre thread : un second G n'en lance pas une autre.
     map_busy: Cell<bool>,
     map_tx: async_channel::Sender<MapResult>,
+    /// Le serveur qui sert la carte au navigateur : il s'arrete seul 10 minutes apres la derniere consultation, au
+    /// prochain G ou a la sortie de picme.
+    map_server: RefCell<Option<serve::Server>>,
     strip: Rc<Filmstrip>,
     chrome: Rc<Chrome>,
     /// Le courant a la derniere mise a jour : un autre fichier remet la vue au fit.
@@ -126,8 +130,8 @@ struct Ui {
 
 type ScanResult = (PathBuf, std::io::Result<Vec<Entry>>);
 
-/// La page de la carte du dossier ; `None` : aucune photo geolocalisee.
-type MapResult = std::io::Result<Option<PathBuf>>;
+/// La page HTML de la carte du dossier ; `None` : aucune photo geolocalisee.
+type MapResult = Option<String>;
 
 /// Liste `dir` sur un autre thread : la fenetre ne l'attend pas.
 fn spawn_scan(dir: PathBuf, recursive: bool, tx: async_channel::Sender<ScanResult>) {
@@ -181,7 +185,7 @@ impl Ui {
     }
 
     /// G : lit la position des photos de la liste courante (tout l'arbre en mode `-r`) et ecrit la page de la carte
-    /// sur un autre thread, puis l'ouvre dans le navigateur (voir `on_map`).
+    /// sur un autre thread, puis la sert en local et l'ouvre dans le navigateur (voir `on_map`).
     fn open_map(&self) {
         if self.map_busy.get() {
             self.osd.message("carte en préparation");
@@ -194,35 +198,40 @@ impl Ui {
             (ctl.entries().to_vec(), current, dir)
         };
         let Some(dir) = dir else { return };
-        let Some(cache) = thumbs::cache_home() else {
-            self.osd.message("carte impossible : dossier de cache introuvable");
-            return;
-        };
         self.map_busy.set(true);
         self.osd.message("carte en préparation");
         let tx = self.map_tx.clone();
         std::thread::Builder::new()
             .name("picme-map".into())
             .spawn(move || {
-                let _ = tx.send_blocking(map::make(&entries, current.as_deref(), &dir, &cache));
+                let _ = tx.send_blocking(map::make(&entries, current.as_deref(), &dir));
             })
             .expect("thread carte");
     }
 
-    /// La page de la carte est prete : le navigateur par defaut l'ouvre (page `file://`, comme `open_folder` ouvre un
-    /// dossier).
+    /// La page de la carte est prete : un serveur sur `127.0.0.1` la sert (une page `file://` n'envoie pas de Referer et
+    /// les tuiles OpenStreetMap la refusent) et le navigateur par defaut ouvre son adresse. Un G de plus remplace le
+    /// serveur : l'ancien s'arrete, son onglet ne se recharge plus.
     fn on_map(&self, result: MapResult) {
         self.map_busy.set(false);
-        match result {
-            Ok(Some(page)) => {
-                let uri = gtk4::gio::File::for_path(&page).uri();
-                match gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
-                    Ok(()) => self.osd.message("carte ouverte dans le navigateur"),
-                    Err(e) => self.osd.message(&format!("navigateur indisponible : {e}")),
-                }
+        let Some(page) = result else {
+            self.osd.message("aucune photo géolocalisée dans ce dossier");
+            return;
+        };
+        let server = match serve::Server::start(page) {
+            Ok(s) => s,
+            Err(e) => {
+                self.osd.message(&format!("carte impossible : serveur local sur 127.0.0.1 : {e}"));
+                return;
             }
-            Ok(None) => self.osd.message("aucune photo géolocalisée dans ce dossier"),
-            Err(e) => self.osd.message(&format!("carte impossible : {e}")),
+        };
+        match gtk4::gio::AppInfo::launch_default_for_uri(&server.url(), None::<&gtk4::gio::AppLaunchContext>) {
+            Ok(()) => {
+                self.osd.message("carte ouverte dans le navigateur");
+                // l'ancien serveur est lache ici, donc arrete
+                *self.map_server.borrow_mut() = Some(server);
+            }
+            Err(e) => self.osd.message(&format!("navigateur indisponible : {e}")),
         }
     }
 
@@ -976,6 +985,7 @@ fn main() {
         info_tx,
         map_busy: Cell::new(false),
         map_tx,
+        map_server: RefCell::default(),
         strip: strip.clone(),
         chrome,
         last_current: RefCell::default(),

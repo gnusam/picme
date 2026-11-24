@@ -10,6 +10,7 @@ pub mod media;
 pub mod meta;
 pub mod orient;
 pub mod pool;
+pub mod serve;
 pub mod thumbs;
 
 pub use error::{Error, Result};
