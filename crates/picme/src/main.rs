@@ -9,6 +9,7 @@ use picme::dnd;
 use picme::fileops::{Done, FileOps, FileOpsHandle};
 use picme::filmstrip::Filmstrip;
 use picme::help::Help;
+use picme::info::InfoPanel;
 use picme::keys::{self, Action, Ctx};
 use picme::launch::{self, Cli};
 use picme::monitor::DirWatch;
@@ -17,10 +18,12 @@ use picme::video::{self, Player};
 use picme::view::ZOOM_STEP;
 use picme_core::decode::{DEFAULT_BUDGET_BYTES, Frame, Target};
 use picme_core::dir::{self, Entry};
+use picme_core::map;
 use picme_core::media::MediaKind;
+use picme_core::meta;
 use picme_core::orient::Orientation;
 use picme_core::pool::{self, Key, Pool};
-use picme_core::thumbs::ThumbStore;
+use picme_core::thumbs::{self, ThumbStore};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -89,6 +92,13 @@ struct Ui {
     settle: RefCell<Option<glib::SourceId>>,
     osd: Rc<Osd>,
     help: Help,
+    /// Panneau des metadonnees (I) et le fichier dont la lecture, sur un autre thread, est attendue.
+    info: InfoPanel,
+    info_want: RefCell<Option<PathBuf>>,
+    info_tx: async_channel::Sender<(PathBuf, meta::Info)>,
+    /// La page de la carte (G) est en preparation sur un autre thread : un second G n'en lance pas une autre.
+    map_busy: Cell<bool>,
+    map_tx: async_channel::Sender<MapResult>,
     strip: Rc<Filmstrip>,
     chrome: Rc<Chrome>,
     /// Le courant a la derniere mise a jour : un autre fichier remet la vue au fit.
@@ -116,6 +126,9 @@ struct Ui {
 
 type ScanResult = (PathBuf, std::io::Result<Vec<Entry>>);
 
+/// La page de la carte du dossier ; `None` : aucune photo geolocalisee.
+type MapResult = std::io::Result<Option<PathBuf>>;
+
 /// Liste `dir` sur un autre thread : la fenetre ne l'attend pas.
 fn spawn_scan(dir: PathBuf, recursive: bool, tx: async_channel::Sender<ScanResult>) {
     std::thread::Builder::new()
@@ -139,6 +152,77 @@ impl Ui {
         match gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
             Ok(()) => self.osd.message("dossier ouvert"),
             Err(e) => self.osd.message(&format!("explorateur indisponible : {e}")),
+        }
+    }
+
+    /// I : les metadonnees du courant sont lues sur un autre thread, le panneau s'ouvre quand elles arrivent (voir
+    /// `on_info`).
+    fn show_info(&self) {
+        let Some(path) = self.ctl.borrow().current().map(|e| e.path.clone()) else { return };
+        *self.info_want.borrow_mut() = Some(path.clone());
+        let tx = self.info_tx.clone();
+        std::thread::Builder::new()
+            .name("picme-info".into())
+            .spawn(move || {
+                let info = meta::read(&path);
+                let _ = tx.send_blocking((path, info));
+            })
+            .expect("thread info");
+    }
+
+    /// Les metadonnees de `path` sont lues : le panneau s'ouvre si c'est toujours ce que l'utilisateur attend (une
+    /// autre image, ou une autre touche, a pu passer entre-temps).
+    fn on_info(&self, path: &Path, info: &meta::Info) {
+        let wanted = self.info_want.borrow_mut().take();
+        let still_current = self.ctl.borrow().current().is_some_and(|e| e.path == path);
+        if wanted.as_deref() == Some(path) && still_current {
+            self.info.show(info);
+        }
+    }
+
+    /// G : lit la position des photos de la liste courante (tout l'arbre en mode `-r`) et ecrit la page de la carte
+    /// sur un autre thread, puis l'ouvre dans le navigateur (voir `on_map`).
+    fn open_map(&self) {
+        if self.map_busy.get() {
+            self.osd.message("carte en préparation");
+            return;
+        }
+        let (entries, current, dir) = {
+            let ctl = self.ctl.borrow();
+            let current = ctl.current().map(|e| e.path.clone());
+            let dir = ctl.dir().map(Path::to_path_buf).or_else(|| current.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)));
+            (ctl.entries().to_vec(), current, dir)
+        };
+        let Some(dir) = dir else { return };
+        let Some(cache) = thumbs::cache_home() else {
+            self.osd.message("carte impossible : dossier de cache introuvable");
+            return;
+        };
+        self.map_busy.set(true);
+        self.osd.message("carte en préparation");
+        let tx = self.map_tx.clone();
+        std::thread::Builder::new()
+            .name("picme-map".into())
+            .spawn(move || {
+                let _ = tx.send_blocking(map::make(&entries, current.as_deref(), &dir, &cache));
+            })
+            .expect("thread carte");
+    }
+
+    /// La page de la carte est prete : le navigateur par defaut l'ouvre (page `file://`, comme `open_folder` ouvre un
+    /// dossier).
+    fn on_map(&self, result: MapResult) {
+        self.map_busy.set(false);
+        match result {
+            Ok(Some(page)) => {
+                let uri = gtk4::gio::File::for_path(&page).uri();
+                match gtk4::gio::AppInfo::launch_default_for_uri(&uri, None::<&gtk4::gio::AppLaunchContext>) {
+                    Ok(()) => self.osd.message("carte ouverte dans le navigateur"),
+                    Err(e) => self.osd.message(&format!("navigateur indisponible : {e}")),
+                }
+            }
+            Ok(None) => self.osd.message("aucune photo géolocalisée dans ce dossier"),
+            Err(e) => self.osd.message(&format!("carte impossible : {e}")),
         }
     }
 
@@ -176,7 +260,9 @@ impl Ui {
         }
         if *self.last_current.borrow() != current {
             *self.last_current.borrow_mut() = current;
-            // un autre fichier : ni cadre de crop, ni lecture, ni Live Photo tenue
+            // un autre fichier : ni cadre de crop, ni lecture, ni Live Photo tenue, ni panneau d'un autre fichier
+            self.info.hide();
+            self.info_want.borrow_mut().take();
             self.cropper.stop();
             self.live_held.set(false);
             self.stop_player();
@@ -579,6 +665,9 @@ impl Ui {
             Action::TurnLeft => self.turn(-1),
             Action::OpenFolder => self.open_folder(),
             Action::Help => self.help.toggle(),
+            // ouvert, le panneau a deja ferme sur la touche (gestionnaire de touches) : ici il n'est jamais visible
+            Action::Info => self.show_info(),
+            Action::Map => self.open_map(),
             Action::Trash => self.remove(true),
             Action::Delete => self.remove(false),
             Action::Undo => self.undo(),
@@ -794,6 +883,9 @@ fn main() {
 
     // scan du dossier sur un autre thread : la fenetre ne l'attend pas
     let (scan_tx, scan_rx) = async_channel::unbounded::<ScanResult>();
+    // metadonnees (I) et page de la carte (G), lues de meme hors du thread d'interface
+    let (info_tx, info_rx) = async_channel::unbounded::<(PathBuf, meta::Info)>();
+    let (map_tx, map_rx) = async_channel::unbounded::<MapResult>();
     if let Some(d) = ctl.dir().map(|d| d.to_path_buf()) {
         spawn_scan(d, ctl.recursive(), scan_tx.clone());
     }
@@ -850,6 +942,8 @@ fn main() {
     osd.attach(&overlay);
     let help = Help::new();
     help.attach(&overlay);
+    let info = InfoPanel::new();
+    info.attach(&overlay);
     window.set_child(Some(&overlay));
     let chrome = Chrome::new(&window, &revealer);
 
@@ -877,6 +971,11 @@ fn main() {
         settle: RefCell::default(),
         osd,
         help,
+        info,
+        info_want: RefCell::default(),
+        info_tx,
+        map_busy: Cell::new(false),
+        map_tx,
         strip: strip.clone(),
         chrome,
         last_current: RefCell::default(),
@@ -996,6 +1095,24 @@ fn main() {
             }
         }
     });
+    glib::spawn_future_local({
+        let ui = Rc::downgrade(&ui);
+        async move {
+            while let Ok((path, info)) = info_rx.recv().await {
+                let Some(ui) = ui.upgrade() else { break };
+                ui.on_info(&path, &info);
+            }
+        }
+    });
+    glib::spawn_future_local({
+        let ui = Rc::downgrade(&ui);
+        async move {
+            while let Ok(result) = map_rx.recv().await {
+                let Some(ui) = ui.upgrade() else { break };
+                ui.on_map(result);
+            }
+        }
+    });
 
     // Fit des la premiere taille connue, puis apres 150 ms sans nouveau resize
     let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
@@ -1042,6 +1159,11 @@ fn main() {
             // l'aide ouverte : la touche la ferme et ne fait rien d'autre
             if ui.help.visible() {
                 ui.help.hide();
+                return glib::Propagation::Stop;
+            }
+            // le panneau d'informations de meme : I le ferme comme toute autre touche
+            if ui.info.visible() {
+                ui.info.hide();
                 return glib::Propagation::Stop;
             }
             let Some(action) = keys::action(key, state, ui.ctx()) else { return glib::Propagation::Proceed };

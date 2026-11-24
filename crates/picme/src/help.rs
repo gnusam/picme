@@ -19,6 +19,8 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Maj+Suppr", "supprime (définitif après 30 s)"),
     ("Ctrl+Z", "annule la suppression (30 s)"),
     ("O", "ouvre le dossier dans l'explorateur"),
+    ("I", "informations EXIF de l'image"),
+    ("G", "carte des photos géolocalisées du dossier"),
     ("", ""),
     ("Espace", "vidéo : pause, reprise"),
     ("Maj+Droite  Maj+Gauche", "vidéo : saute de 5 s"),

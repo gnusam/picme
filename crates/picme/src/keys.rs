@@ -32,6 +32,10 @@ pub enum Action {
     OpenFolder,
     /// ? ou F1 : panneau d'aide des raccourcis.
     Help,
+    /// I : panneau des metadonnees EXIF de l'image courante.
+    Info,
+    /// G : carte des photos geolocalisees du dossier, dans le navigateur.
+    Map,
     Quit,
     /// C : cadre de recadrage sur l'image.
     Crop,
@@ -113,6 +117,8 @@ pub fn action(key: Key, state: ModifierType, ctx: Ctx) -> Option<Action> {
         Key::Delete | Key::KP_Delete => Action::Trash,
         Key::F11 => Action::Fullscreen,
         Key::o => Action::OpenFolder,
+        Key::i => Action::Info,
+        Key::g => Action::Map,
         Key::question | Key::F1 => Action::Help,
         Key::q | Key::Escape => Action::Quit,
         _ => return None,
@@ -161,6 +167,24 @@ mod tests {
         assert_eq!(action(Key::plus, NONE), Some(Action::ZoomIn));
         assert_eq!(action(Key::minus, NONE), Some(Action::ZoomOut));
         assert_eq!(action(Key::_0, NONE), Some(Action::Fit));
+    }
+
+    #[test]
+    fn i_opens_the_info_panel_and_g_the_map() {
+        assert_eq!(action(Key::i, NONE), Some(Action::Info));
+        assert_eq!(action(Key::I, SHIFT), Some(Action::Info));
+        assert_eq!(action(Key::I, ModifierType::LOCK_MASK), Some(Action::Info), "verr. maj");
+        assert_eq!(action(Key::g, NONE), Some(Action::Map));
+        assert_eq!(action(Key::G, ModifierType::LOCK_MASK), Some(Action::Map), "verr. maj");
+        assert_eq!(action(Key::i, ModifierType::CONTROL_MASK), None);
+        assert_eq!(action(Key::g, ModifierType::CONTROL_MASK), None);
+        // pendant un crop, ni l'un ni l'autre
+        let crop = Ctx { video: false, crop: true };
+        assert_eq!(super::action(Key::i, NONE, crop), None);
+        assert_eq!(super::action(Key::g, NONE, crop), None);
+        // sur une video, les deux restent disponibles
+        let video = Ctx { video: true, crop: false };
+        assert_eq!(super::action(Key::i, NONE, video), Some(Action::Info));
     }
 
     #[test]

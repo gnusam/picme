@@ -128,9 +128,13 @@ pub fn uri(path: &Path) -> String {
 /// Racine par defaut : `$XDG_CACHE_HOME/thumbnails`, sinon `$HOME/.cache/thumbnails` (valeurs relatives ignorees,
 /// comme le veut la spec XDG).
 pub fn default_root() -> Option<PathBuf> {
+    Some(cache_home()?.join("thumbnails"))
+}
+
+/// `$XDG_CACHE_HOME`, sinon `$HOME/.cache` (valeurs relatives ignorees).
+pub fn cache_home() -> Option<PathBuf> {
     let absolute = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute());
-    let cache = absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|h| h.join(".cache")))?;
-    Some(cache.join("thumbnails"))
+    absolute("XDG_CACHE_HOME").or_else(|| absolute("HOME").map(|h| h.join(".cache")))
 }
 
 /// Nom de fichier d'une miniature : md5 hexadecimal minuscule de l'URI, suivi de `.png`.

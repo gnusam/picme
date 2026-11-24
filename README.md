@@ -78,9 +78,10 @@ Ce que picme fait et ne fait pas, face aux visionneuses courantes sous Linux. Re
 | Cache de miniatures freedesktop | oui | partiel | non | non | oui | n.t. | oui | oui |
 | GIF animé | non | non | oui | oui | oui | oui | n.t. | oui |
 | Diaporama | non | oui | oui | oui | oui | n.t. | oui | oui |
-| Panneau EXIF | non | partiel | partiel | non | oui | oui | oui | oui |
+| Panneau EXIF | oui | partiel | partiel | non | oui | oui | oui | oui |
+| Carte des coordonnées GPS | oui, carte de tout le dossier, dans le navigateur | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. |
 
-Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, la corbeille avec annulation et les opérations sans perte sur les fichiers, dans une fenêtre qui se pilote au clavier. En contrepartie, il n'a ni Wayland natif, ni GIF animé, ni diaporama, ni panneau EXIF. Si tu cherches un outil minimal pour un window manager X11, feh et nsxiv font moins de choses et le font très bien ; si tu veux tout cela dans une application de bureau complète, regarde Gwenview.
+Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, la corbeille avec annulation et les opérations sans perte sur les fichiers, dans une fenêtre qui se pilote au clavier. En contrepartie, il n'a ni Wayland natif, ni GIF animé, ni diaporama. Si tu cherches un outil minimal pour un window manager X11, feh et nsxiv font moins de choses et le font très bien ; si tu veux tout cela dans une application de bureau complète, regarde Gwenview.
 
 ## Raccourcis
 
@@ -103,6 +104,8 @@ Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, 
 | F11 | plein écran |
 | ?, F1 | aide : la liste des raccourcis par-dessus l'image, une touche la ferme |
 | O | ouvre le dossier courant dans le gestionnaire de fichiers du système |
+| I | informations de l'image par-dessus l'image, une touche les ferme : nom, taille, dimensions, date de prise de vue, appareil, objectif, focale, ouverture, temps de pose, ISO et position GPS, quand le fichier les porte |
+| G | carte des photos géolocalisées du dossier (de tout l'arbre avec `-r`) : une page HTML écrite dans `$XDG_CACHE_HOME/picme/` que le navigateur par défaut ouvre, avec un marqueur par photo et l'image affichée au centre ; Leaflet et les tuiles OpenStreetMap sont chargés par le navigateur, picme ne fait aucun appel réseau |
 | Q, Échap | quitter (Échap annule d'abord un recadrage) |
 
 À la souris : la molette change d'image, Ctrl+molette zoome autour du curseur, le double-clic bascule le zoom, le glisser déplace l'image quand elle dépasse la fenêtre.
