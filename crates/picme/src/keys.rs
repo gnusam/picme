@@ -1,5 +1,5 @@
 //! Raccourcis clavier : la table touche -> action, sans effet de bord (l'application des actions est dans `main`).
-//! Le contexte (`Ctx`) change le sens de quelques touches : Espace et Maj+fleches sur une video, tout pendant un crop.
+//! Le contexte (`Ctx`) change le sens de quelques touches : Espace sur une video ou un GIF anime, Maj+fleches sur une video, tout pendant un crop.
 
 use gtk4::gdk::{self, Key, ModifierType};
 
@@ -44,7 +44,7 @@ pub enum Action {
     /// Entree pendant le crop : copie `<nom>-crop.<ext>` ; Maj+Entree (`replace`) : remplace l'original, qui part a
     /// la corbeille.
     CropApply { replace: bool },
-    /// Espace sur une video : pause et reprise.
+    /// Espace sur une video ou un GIF anime : pause et reprise.
     Pause,
     /// Maj+droite et Maj+gauche sur une video : saut de `video::SEEK_STEP` secondes.
     SeekForward,
@@ -62,6 +62,8 @@ pub struct Ctx {
     pub video: bool,
     /// Le cadre de crop est ouvert : seules Echap, Entree et deux touches de fenetre agissent.
     pub crop: bool,
+    /// Un GIF anime est en lecture (ou en pause) : Espace le met en pause, comme une video.
+    pub anim: bool,
 }
 
 /// L'action d'une touche pressee avec les modificateurs `state`. Ctrl+gauche et Ctrl+droite tournent la vue ; tout
@@ -89,6 +91,9 @@ pub fn action(key: Key, state: ModifierType, ctx: Ctx) -> Option<Action> {
             _ if key.to_lower() == Key::z && !shift => Some(Action::Undo),
             _ => None,
         };
+    }
+    if ctx.anim && key == Key::space {
+        return Some(Action::Pause);
     }
     if ctx.video {
         match key {
@@ -179,11 +184,11 @@ mod tests {
         assert_eq!(action(Key::i, ModifierType::CONTROL_MASK), None);
         assert_eq!(action(Key::g, ModifierType::CONTROL_MASK), None);
         // pendant un crop, ni l'un ni l'autre
-        let crop = Ctx { video: false, crop: true };
+        let crop = Ctx { crop: true, ..Ctx::default() };
         assert_eq!(super::action(Key::i, NONE, crop), None);
         assert_eq!(super::action(Key::g, NONE, crop), None);
         // sur une video, les deux restent disponibles
-        let video = Ctx { video: true, crop: false };
+        let video = Ctx { video: true, ..Ctx::default() };
         assert_eq!(super::action(Key::i, NONE, video), Some(Action::Info));
     }
 
@@ -226,7 +231,7 @@ mod tests {
 
     #[test]
     fn space_and_shift_arrows_drive_a_video_and_plain_arrows_keep_navigating() {
-        let video = Ctx { video: true, crop: false };
+        let video = Ctx { video: true, ..Ctx::default() };
         assert_eq!(super::action(Key::space, NONE, video), Some(Action::Pause));
         assert_eq!(super::action(Key::Right, SHIFT, video), Some(Action::SeekForward));
         assert_eq!(super::action(Key::Left, SHIFT, video), Some(Action::SeekBack));
@@ -241,8 +246,21 @@ mod tests {
     }
 
     #[test]
+    fn space_pauses_a_playing_animation_and_only_that() {
+        let anim = Ctx { anim: true, ..Ctx::default() };
+        assert_eq!(super::action(Key::space, NONE, anim), Some(Action::Pause));
+        // les autres touches ne changent pas : les fleches naviguent, Maj+fleche aussi (pas de saut dans un GIF)
+        assert_eq!(super::action(Key::Right, NONE, anim), Some(Action::Next));
+        assert_eq!(super::action(Key::Right, SHIFT, anim), Some(Action::Next));
+        // sans animation en lecture (image fixe, GIF pas encore decode), Espace avance
+        assert_eq!(super::action(Key::space, NONE, Ctx::default()), Some(Action::Next));
+        // le crop prime
+        assert_eq!(super::action(Key::space, NONE, Ctx { anim: true, crop: true, ..Ctx::default() }), None);
+    }
+
+    #[test]
     fn during_a_crop_only_escape_enter_and_the_window_keys_act() {
-        let crop = Ctx { video: false, crop: true };
+        let crop = Ctx { crop: true, ..Ctx::default() };
         assert_eq!(super::action(Key::Escape, NONE, crop), Some(Action::CropCancel));
         assert_eq!(super::action(Key::Return, NONE, crop), Some(Action::CropApply { replace: false }));
         assert_eq!(super::action(Key::KP_Enter, NONE, crop), Some(Action::CropApply { replace: false }));

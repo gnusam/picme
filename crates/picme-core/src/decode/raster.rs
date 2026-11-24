@@ -1,4 +1,5 @@
-//! PNG, WebP, TIFF, GIF (premiere image), BMP, ICO, QOI et PNM par la crate `image` : decode complet, puis reduction.
+//! PNG, WebP, TIFF, GIF (premiere image ; les frames suivants sont dans `anim`), BMP, ICO, QOI et PNM par la crate
+//! `image` : decode complet, puis reduction.
 
 use super::{Frame, Plan, Target};
 use crate::error::{Error, Result};

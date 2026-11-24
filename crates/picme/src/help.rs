@@ -22,7 +22,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("I", "informations EXIF de l'image"),
     ("G", "carte des photos géolocalisées du dossier"),
     ("", ""),
-    ("Espace", "vidéo : pause, reprise"),
+    ("Espace", "vidéo, GIF animé : pause, reprise"),
     ("Maj+Droite  Maj+Gauche", "vidéo : saute de 5 s"),
     ("M", "vidéo : son"),
     ("L (tenue)", "joue la vidéo d'une Live Photo"),

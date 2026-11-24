@@ -18,8 +18,12 @@ type OnNav = Box<dyn Fn(isize)>;
 
 /// Texture d'une frame RGBA decodee (la copie est evitee : les octets sont donnes a GDK).
 pub fn texture_of(f: Frame) -> gdk::Texture {
-    let stride = f.w as usize * 4;
-    gdk::MemoryTexture::new(f.w as i32, f.h as i32, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(f.rgba), stride).upcast()
+    rgba_texture(f.rgba, f.w, f.h)
+}
+
+/// Texture de `w` x `h` octets RGBA, sans copie (un frame de GIF anime).
+pub fn rgba_texture(rgba: Vec<u8>, w: u32, h: u32) -> gdk::Texture {
+    gdk::MemoryTexture::new(w as i32, h as i32, gdk::MemoryFormat::R8g8b8a8, &glib::Bytes::from_owned(rgba), w as usize * 4).upcast()
 }
 
 mod imp {
@@ -236,6 +240,11 @@ impl Canvas {
     pub fn set_image(&self, texture: &gdk::Texture, full_w: u32, full_h: u32) {
         self.imp().image.replace(Some((texture.clone(), full_w, full_h)));
         self.queue_draw();
+    }
+
+    /// L'image affichee : texture et dimensions de l'image entiere (a remettre telle quelle par `set_image`).
+    pub fn image(&self) -> Option<(gdk::Texture, u32, u32)> {
+        self.imp().image.borrow().clone()
     }
 
     pub fn has_image(&self) -> bool {

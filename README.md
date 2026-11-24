@@ -76,18 +76,18 @@ Ce que picme fait et ne fait pas, face aux visionneuses courantes sous Linux. Re
 | Navigation récursive | oui (`-r`) | oui | oui | oui | non | non | n.t. | partiel |
 | Bandeau de miniatures | oui | non | non | non | oui | non | oui | n.t. |
 | Cache de miniatures freedesktop | oui | partiel | non | non | oui | n.t. | oui | oui |
-| GIF animé | non | non | oui | oui | oui | oui | n.t. | oui |
+| GIF animé | oui, en boucle, Espace pause (décodé en mémoire : au-delà de 256 Mo ou 2000 frames, image fixe) | non | oui | oui | oui | oui | n.t. | oui |
 | Diaporama | non | oui | oui | oui | oui | n.t. | oui | oui |
 | Panneau EXIF | oui | partiel | partiel | non | oui | oui | oui | oui |
 | Carte des coordonnées GPS | oui, carte de tout le dossier, dans le navigateur (page servie sur 127.0.0.1 le temps de la consultation) | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. | n.t. |
 
-Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, la corbeille avec annulation et les opérations sans perte sur les fichiers, dans une fenêtre qui se pilote au clavier. En contrepartie, il n'a ni Wayland natif, ni GIF animé, ni diaporama. Si tu cherches un outil minimal pour un window manager X11, feh et nsxiv font moins de choses et le font très bien ; si tu veux tout cela dans une application de bureau complète, regarde Gwenview.
+Lecture honnête : picme est la seule de la liste à cumuler la lecture vidéo, la corbeille avec annulation et les opérations sans perte sur les fichiers, dans une fenêtre qui se pilote au clavier. En contrepartie, il n'a ni Wayland natif, ni diaporama, et ses GIF animés sont décodés en entier en mémoire : un GIF de plus de 256 Mo décodés ou de plus de 2000 frames reste une image fixe. Si tu cherches un outil minimal pour un window manager X11, feh et nsxiv font moins de choses et le font très bien ; si tu veux tout cela dans une application de bureau complète, regarde Gwenview.
 
 ## Raccourcis
 
 | Touche | Action |
 |---|---|
-| Droite, Page suivante, Espace | image suivante (sur une vidéo, Espace est pause et reprise) |
+| Droite, Page suivante, Espace | image suivante (sur une vidéo ou un GIF animé, Espace est pause et reprise) |
 | Gauche, Page précédente, Retour arrière | image précédente |
 | Home, End | première, dernière image |
 | F | bascule entre ajusté à la fenêtre et 100 % |

@@ -571,6 +571,12 @@ impl<T: Clone> Controller<T> {
         Show::Keep
     }
 
+    /// Le courant, une fois une de ses images a l'ecran : un GIF ne s'anime qu'en second temps, apres sa premiere image.
+    pub fn current_shown(&self) -> Option<&Entry> {
+        let e = self.current()?;
+        self.shows(&Ident::of(e)).then_some(e)
+    }
+
     fn shows(&self, id: &Ident) -> bool {
         self.shown.as_ref().is_some_and(|(s, _, _)| s == id)
     }
@@ -912,6 +918,18 @@ mod tests {
 
     fn preview(name: &str, p: u32) -> (String, Target, u32) {
         (name.to_string(), Target::Preview, p)
+    }
+
+    #[test]
+    fn the_current_is_shown_only_once_one_of_its_images_is() {
+        let mut r = rig("ctl-current-shown", 3, 1, 256 << 20);
+        assert!(r.c.current_shown().is_none(), "rien d'affiche : le GIF n'est pas encore anime");
+        let p = r.thumbs.take("i01.jpg", Level::Preview);
+        shown(r.c.on_result(p, Ok(frame(256, 192))));
+        assert_eq!(r.c.current_shown().unwrap().path.file_name().unwrap(), "i01.jpg");
+        // un autre courant dont rien n'est pret : l'image du precedent reste a l'ecran, mais ce n'est pas la sienne
+        assert!(matches!(r.c.go(1), Show::Keep));
+        assert!(r.c.current_shown().is_none());
     }
 
     #[test]

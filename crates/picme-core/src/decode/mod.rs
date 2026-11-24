@@ -4,6 +4,7 @@
 //! calculent dans l'espace affiche, puis se convertissent dans l'espace stocke pour reduire AVANT d'orienter
 //! (la rotation travaille sur moins de pixels). Aucun `catch_unwind` ici : c'est a l'appelant d'envelopper.
 
+mod anim;
 mod heif;
 mod jpeg;
 mod jxl;
@@ -16,6 +17,8 @@ use crate::error::{Error, Result};
 use crate::media::{self, MediaKind};
 use crate::orient::Orientation;
 use std::path::Path;
+
+pub use anim::{AnimFrame, Animation, MAX_ANIM_BYTES, MAX_ANIM_FRAMES, Outcome as AnimOutcome, decode_animation};
 
 /// Cote de la boite du `Preview` : celle de la miniature freedesktop `large`.
 pub const PREVIEW_SIZE: u32 = 256;

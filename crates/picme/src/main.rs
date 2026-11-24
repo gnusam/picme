@@ -1,5 +1,6 @@
 use gtk4 as gtk;
 use gtk::{gdk, glib, prelude::*};
+use picme::anim::{self, Playback};
 use picme::app::{self, Controller, Level, Show};
 use picme::canvas::{self, Canvas};
 use gstreamer as gst;
@@ -16,7 +17,7 @@ use picme::monitor::DirWatch;
 use picme::osd::{self, Osd};
 use picme::video::{self, Player};
 use picme::view::ZOOM_STEP;
-use picme_core::decode::{DEFAULT_BUDGET_BYTES, Frame, Target};
+use picme_core::decode::{AnimOutcome, Animation, DEFAULT_BUDGET_BYTES, Frame, Target};
 use picme_core::dir::{self, Entry};
 use picme_core::map;
 use picme_core::media::MediaKind;
@@ -77,6 +78,17 @@ struct Bench {
     rss_every_100: Vec<u64>,
 }
 
+/// Le GIF anime en lecture : ses frames (le premier a l'ecran au depart) et, pour l'arret, l'image fixe que le canvas
+/// montrait avant (mise a jour par chaque `Fit` ou `Full` que le controller rend du meme fichier).
+struct Anim {
+    key: Key,
+    play: Playback<gdk::Texture>,
+    /// Dimensions de l'image entiere.
+    w: u32,
+    h: u32,
+    still: Option<(gdk::Texture, u32, u32)>,
+}
+
 fn rss_kb() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0)
@@ -124,6 +136,14 @@ struct Ui {
     /// L est tenue : le `.mov` de la Live Photo joue.
     live_held: Cell<bool>,
     live_badge: gtk::Label,
+    /// Le pool qui decode les frames d'un GIF anime, et le GIF voulu : le job en cours s'arrete quand il change.
+    anim_pool: Pool<Key>,
+    anim_want: anim::Wanted,
+    /// Le dernier GIF dont le decode a ete demande : un GIF n'est demande qu'une fois, sauf decode abandonne.
+    anim_tried: RefCell<Option<Key>>,
+    /// L'animation en lecture, et le timer de son prochain frame (jamais un id deja servi).
+    anim: RefCell<Option<Anim>>,
+    anim_tick: RefCell<Option<glib::SourceId>>,
     /// Les scans de dossier (au demarrage, puis a chaque fichier depose d'un autre dossier).
     scan_tx: async_channel::Sender<ScanResult>,
 }
@@ -236,6 +256,7 @@ impl Ui {
     }
 
     fn apply(self: &Rc<Self>, show: Show<gdk::Texture>) {
+        let show = self.filter_anim(show);
         match show {
             Show::Keep => {}
             Show::Image(img) => {
@@ -283,6 +304,140 @@ impl Ui {
         self.sync();
         self.sync_turns();
         self.sync_player();
+        self.sync_anim();
+    }
+
+    /// Une animation en lecture garde l'ecran : l'image fixe du meme fichier que rend le controller (`Fit`, `Full`) est
+    /// gardee pour l'arret, sans toucher au canvas ; tout autre changement (un autre fichier, une autre version du
+    /// fichier, plus d'image) arrete l'animation et laisse l'image fixe a l'ecran.
+    fn filter_anim(&self, show: Show<gdk::Texture>) -> Show<gdk::Texture> {
+        let Some(playing) = self.anim.borrow().as_ref().map(|a| a.key.clone()) else { return show };
+        let current = self.ctl.borrow().current().map(|e| Key::of(e, Target::Full));
+        if current.as_ref() != Some(&playing) {
+            self.stop_anim(true);
+            return show;
+        }
+        match show {
+            Show::Image(img) => {
+                if let Some(a) = self.anim.borrow_mut().as_mut() {
+                    a.still = Some((img.texture, img.full_w, img.full_h));
+                }
+                Show::Keep
+            }
+            Show::Keep => Show::Keep,
+            other => {
+                self.stop_anim(false);
+                other
+            }
+        }
+    }
+
+    /// Le courant est un GIF dont une image est a l'ecran : ses frames se decodent en second temps (voir `on_anim`),
+    /// jamais pendant la repetition d'une touche ni sous un cadre de crop. Le job d'un autre GIF s'arrete ou quitte la file.
+    fn sync_anim(&self) {
+        let key = {
+            let ctl = self.ctl.borrow();
+            ctl.current_shown()
+                .filter(|e| e.kind == MediaKind::Gif && !ctl.repeating() && !self.cropper.is_active())
+                .map(|e| Key::of(e, Target::Full))
+        };
+        self.anim_want.set(key.clone());
+        self.anim_pool.retain(|k| Some(k) == key.as_ref());
+        let Some(key) = key else { return };
+        if self.anim.borrow().is_some() || self.anim_tried.borrow().as_ref() == Some(&key) {
+            return;
+        }
+        *self.anim_tried.borrow_mut() = Some(key.clone());
+        self.anim_pool.submit(key, 0);
+    }
+
+    /// Les frames d'un GIF sont decodes. Une erreur de decode laisse l'image fixe, sans bruit ; un seul frame aussi ; un
+    /// GIF au-dela du plafond de memoire le dit en une ligne.
+    fn on_anim(self: &Rc<Self>, key: Key, result: picme_core::Result<AnimOutcome>) {
+        let wanted = self.anim_want.is(&key);
+        match result {
+            // decode abandonne parce qu'un autre fichier etait voulu : si le fichier est de nouveau voulu (aller-retour),
+            // il repart ; sinon il sera redemande a son prochain affichage
+            Err(picme_core::Error::Invalid(_)) => {
+                if wanted {
+                    self.anim_pool.submit(key, 0);
+                } else if self.anim_tried.borrow().as_ref() == Some(&key) {
+                    self.anim_tried.borrow_mut().take();
+                }
+            }
+            Err(_) => {}
+            Ok(_) if !wanted => {}
+            Ok(AnimOutcome::Single) => {}
+            Ok(AnimOutcome::TooBig) => self.osd.message("animation trop lourde (plus de 256 Mo décodée) : image fixe"),
+            Ok(AnimOutcome::Animated(a)) => self.play_anim(key, a),
+        }
+    }
+
+    /// Le canvas montre les frames, l'un apres l'autre, au rythme du fichier ; zoom, deplacement et rotation restent
+    /// ceux de l'image.
+    fn play_anim(self: &Rc<Self>, key: Key, a: Animation) {
+        let (w, h) = (a.w, a.h);
+        let frames = a.frames.into_iter().map(|f| (canvas::rgba_texture(f.rgba, w, h), f.delay)).collect();
+        let play = Playback::new(frames);
+        let still = self.canvas.image();
+        self.canvas.set_image(play.frame(), w, h);
+        *self.anim.borrow_mut() = Some(Anim { key, play, w, h, still });
+        self.arm_anim();
+    }
+
+    /// Programme le frame suivant ; sans effet en pause.
+    fn arm_anim(self: &Rc<Self>) {
+        self.clear_anim_tick();
+        let delay = match self.anim.borrow().as_ref() {
+            Some(a) if !a.play.paused() => a.play.delay(),
+            _ => return,
+        };
+        let ui = Rc::downgrade(self);
+        *self.anim_tick.borrow_mut() = Some(glib::timeout_add_local_once(delay, move || {
+            let Some(ui) = ui.upgrade() else { return };
+            ui.anim_tick.borrow_mut().take();
+            ui.step_anim();
+        }));
+    }
+
+    fn step_anim(self: &Rc<Self>) {
+        let (texture, w, h) = {
+            let mut anim = self.anim.borrow_mut();
+            let Some(a) = anim.as_mut() else { return };
+            (a.play.advance().clone(), a.w, a.h)
+        };
+        self.canvas.set_image(&texture, w, h);
+        self.arm_anim();
+    }
+
+    fn clear_anim_tick(&self) {
+        if let Some(id) = self.anim_tick.borrow_mut().take() {
+            id.remove();
+        }
+    }
+
+    /// Arrete l'animation : le timer est supprime, les frames libres. `restore` : le canvas retrouve l'image fixe.
+    fn stop_anim(&self, restore: bool) {
+        self.clear_anim_tick();
+        let Some(a) = self.anim.borrow_mut().take() else { return };
+        if restore && let Some((texture, w, h)) = a.still {
+            self.canvas.set_image(&texture, w, h);
+        }
+    }
+
+    /// Espace sur un GIF anime : pause et reprise, comme une video.
+    fn pause_anim(self: &Rc<Self>) {
+        let paused = match self.anim.borrow_mut().as_mut() {
+            Some(a) => a.play.toggle_pause(),
+            None => return,
+        };
+        if paused {
+            self.clear_anim_tick();
+            self.osd.message("pause");
+        } else {
+            self.osd.message("lecture");
+            self.arm_anim();
+        }
     }
 
     /// Dossier sans media : la fenetre est vide, le message reste jusqu'a l'arrivee d'un fichier (`apply`).
@@ -297,7 +452,11 @@ impl Ui {
 
     /// Ce que les touches voient de la vue.
     fn ctx(&self) -> Ctx {
-        Ctx { video: self.ctl.borrow().current().is_some_and(|e| e.kind == MediaKind::Video), crop: self.cropper.is_active() }
+        Ctx {
+            video: self.ctl.borrow().current().is_some_and(|e| e.kind == MediaKind::Video),
+            crop: self.cropper.is_active(),
+            anim: self.anim.borrow().is_some(),
+        }
     }
 
     /// Lit `path` a `start`, a la place du lecteur en cours.
@@ -383,8 +542,13 @@ impl Ui {
         }
     }
 
-    /// Espace sur une video : pause et reprise ; sans lecteur (touche tenue puis relachee), elle se lance.
+    /// Espace sur une video : pause et reprise ; sans lecteur (touche tenue puis relachee), elle se lance. Sur un GIF
+    /// anime, c'est l'animation qui se met en pause.
     fn pause(self: &Rc<Self>) {
+        if self.anim.borrow().is_some() {
+            self.pause_anim();
+            return;
+        }
         let state = self.player.borrow().as_ref().map(|(_, p)| (p.toggle_pause(), p.position()));
         match state {
             Some((true, at)) => self.osd.message(&format!("pause  {}", video::clock(at))),
@@ -442,10 +606,20 @@ impl Ui {
         } else if self.canvas.quarters() != 0 {
             self.osd.message("recadrage : la vue est tournée (Ctrl+flèches, ou R en cours)");
         } else {
+            // le cadre se pose sur l'image fixe : l'animation s'arrete (et son decode, s'il court encore)
+            self.stop_anim(true);
             self.canvas.fit();
             self.cropper.start();
+            self.sync_anim();
             self.osd.message("recadrage : Entrée copie, Maj+Entrée remplace, Échap annule");
         }
+    }
+
+    /// Echap pendant le crop : le cadre se ferme, le GIF reprend son animation.
+    fn crop_cancel(&self) {
+        self.cropper.stop();
+        self.anim_tried.borrow_mut().take();
+        self.sync_anim();
     }
 
     /// Entree (copie) et Maj+Entree (remplacement, l'original va a la corbeille) : le thread d'ecriture recadre.
@@ -583,6 +757,8 @@ impl Ui {
             }
         };
         if current.is_some_and(|c| touched.contains(&c)) {
+            // le fichier est remplace : retour a l'image fixe, l'animation de l'ancienne version est abandonnee
+            self.stop_anim(true);
             self.reset_view();
             // `reset_view` ne previent pas le controller : il lache le `Full` d'un zoom en cours
             let show = self.ctl.borrow_mut().set_full(false);
@@ -689,10 +865,11 @@ impl Ui {
             }
             Action::Quit => {
                 self.stop_player();
+                self.stop_anim(false);
                 main_loop.quit();
             }
             Action::Crop => self.crop_start(),
-            Action::CropCancel => self.cropper.stop(),
+            Action::CropCancel => self.crop_cancel(),
             Action::CropApply { replace } => self.crop_apply(replace),
             Action::Pause => self.pause(),
             Action::SeekForward => self.seek(true),
@@ -854,6 +1031,10 @@ fn main() {
         tx.clone(),
     ));
     let decode_pool = Pool::new("picme-decode", pool::decode_threads(), app::decode_work(budget), tx);
+    // les frames d'un GIF anime : un seul thread, un seul GIF a la fois (celui du courant)
+    let (anim_tx, anim_rx) = async_channel::unbounded::<(Key, picme_core::Result<AnimOutcome>)>();
+    let anim_want = anim::Wanted::default();
+    let anim_pool = Pool::new("picme-anim", 1, anim::work(anim_want.clone()), anim_tx);
     let mut ctl = Controller::new(budget, Box::new(decode_pool), Box::new(thumbs_pool.clone()), Box::new(canvas::texture_of));
     // un fichier donne s'affiche ; sinon le premier media du dossier, trouve sans attendre le listing complet (le
     // scan ci-dessous le rend), et un dossier sans media s'ouvre vide, surveille
@@ -999,6 +1180,11 @@ fn main() {
         audio: Cell::new(false),
         live_held: Cell::new(false),
         live_badge,
+        anim_pool,
+        anim_want,
+        anim_tried: RefCell::default(),
+        anim: RefCell::default(),
+        anim_tick: RefCell::default(),
         scan_tx,
     });
     ui.watch_dir();
@@ -1073,6 +1259,15 @@ fn main() {
             while let Ok((key, result)) = rx.recv().await {
                 let Some(ui) = ui.upgrade() else { break };
                 ui.on_result(key, result);
+            }
+        }
+    });
+    glib::spawn_future_local({
+        let ui = Rc::downgrade(&ui);
+        async move {
+            while let Ok((key, result)) = anim_rx.recv().await {
+                let Some(ui) = ui.upgrade() else { break };
+                ui.on_anim(key, result);
             }
         }
     });
@@ -1261,6 +1456,7 @@ fn main() {
 
     // lecteur ferme (le fichier relache), miniatures en attente ecrites, puis sortie sans attendre les decodes en cours
     ui.stop_player();
+    ui.stop_anim(false);
     drop(fileops);
     std::process::exit(0);
 }
