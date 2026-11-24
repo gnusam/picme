@@ -1,9 +1,10 @@
 //! Affichage discret par-dessus l'image : nom, position et zoom de l'image courante, et les messages et erreurs.
-//! Tout s'efface seul apres `OSD_TIMEOUT`.
+//! Tout s'efface seul apres `OSD_TIMEOUT`, sauf le message epingle (`pin`).
 
 use crate::chrome::OneShot;
 use gtk4 as gtk;
 use gtk::{pango, prelude::*};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ pub struct Osd {
     message: gtk::Label,
     info_timer: OneShot,
     message_timer: OneShot,
+    /// Le message affiche est celui de `pin`, sans echeance.
+    pinned: Cell<bool>,
 }
 
 fn label(class: &str, halign: gtk::Align, valign: gtk::Align) -> gtk::Label {
@@ -53,7 +56,7 @@ impl Osd {
         let message = label("osd-message", gtk::Align::Center, gtk::Align::Start);
         message.set_max_width_chars(90);
         message.set_margin_top(52);
-        Rc::new(Osd { info, message, info_timer: OneShot::default(), message_timer: OneShot::default() })
+        Rc::new(Osd { info, message, info_timer: OneShot::default(), message_timer: OneShot::default(), pinned: Cell::new(false) })
     }
 
     pub fn attach(&self, overlay: &gtk::Overlay) {
@@ -67,7 +70,23 @@ impl Osd {
 
     /// Un message ou une erreur, a la place du precedent.
     pub fn message(self: &Rc<Self>, text: &str) {
+        self.pinned.set(false);
         Self::show(&self.message, &self.message_timer, text);
+    }
+
+    /// Un message qui reste tant que la vue n'a rien d'autre a dire (dossier sans media) : `unpin` l'efface.
+    pub fn pin(&self, text: &str) {
+        self.pinned.set(true);
+        self.message_timer.cancel();
+        self.message.set_text(text);
+        self.message.set_visible(true);
+    }
+
+    /// Efface le message posé par `pin` ; un message ordinaire en cours n'est pas touché.
+    pub fn unpin(&self) {
+        if self.pinned.replace(false) {
+            self.message.set_visible(false);
+        }
     }
 
     pub fn info_text(&self) -> Option<String> {

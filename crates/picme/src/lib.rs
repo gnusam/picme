@@ -8,6 +8,7 @@ pub mod dnd;
 pub mod fileops;
 pub mod filmstrip;
 pub mod keys;
+pub mod launch;
 pub mod monitor;
 pub mod osd;
 pub mod video;

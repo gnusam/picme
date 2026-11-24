@@ -134,6 +134,28 @@ pub fn decodable(kind: MediaKind) -> bool {
     kind != MediaKind::Video && (kind != MediaKind::Raw || cfg!(feature = "raw"))
 }
 
+/// Le message d'un echec de decode, distinct selon la cause : fichier introuvable ou illisible, contenu sans signature
+/// de media connue, format reconnu mais sans decodeur, decodeur en echec.
+pub fn failure_message(path: &Path, e: &Error) -> String {
+    let unrecognized = || "contenu non reconnu comme média".to_string();
+    let why = match e {
+        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => "introuvable".to_string(),
+        Error::Io(io) => format!("illisible ({})", dir::io_reason(io)),
+        Error::Decode(m) => match media::sniff_path(path) {
+            Ok(None) => unrecognized(),
+            _ => format!("décodage en échec ({m})"),
+        },
+        Error::Unsupported(m) => match media::detect(path) {
+            None => unrecognized(),
+            Some(MediaKind::Raw) => "format RAW reconnu, non pris en charge par cette version".to_string(),
+            Some(MediaKind::Video) => "vidéo, aperçu indisponible".to_string(),
+            Some(_) => format!("non pris en charge ({m})"),
+        },
+        Error::Invalid(m) => m.clone(),
+    };
+    format!("{} : {why}", path.display())
+}
+
 /// Dimensions d'une image `fw` x `fh` dans une boite `bw` x `bh`, jamais agrandie (meme calcul que le decode).
 pub(crate) fn fit_dims(fw: u32, fh: u32, bw: u32, bh: u32) -> (u32, u32) {
     if fw <= bw && fh <= bh {
@@ -260,8 +282,9 @@ impl<T: Clone> Controller<T> {
     pub fn open(&mut self, path: &Path) -> Show<T> {
         let path = canonical(path);
         if !self.entries.iter().any(|e| e.path == path) {
-            let Some(entry) = dir::stat_entry(&path) else {
-                return Show::Failed(format!("{} : introuvable ou pas une image", path.display()));
+            // un fichier nomme par l'utilisateur est lu par contenu, quelle que soit son extension
+            let Some(entry) = dir::stat_entry_explicit(&path) else {
+                return Show::Failed(format!("{} : {}", path.display(), dir::reject_reason(&path)));
             };
             let parent = path.parent().map(Path::to_path_buf);
             if parent != self.dir {
@@ -277,8 +300,20 @@ impl<T: Clone> Controller<T> {
         self.refresh()
     }
 
+    /// Ouvre un dossier sans fichier initial (`dir` absolu et canonique) : liste vide et rien de courant, en attendant
+    /// le scan (`set_entries`) ou un fichier qui y apparait (`reconcile`) ; la premiere entree devient alors le courant.
+    pub fn open_dir(&mut self, dir: &Path) -> Show<T> {
+        self.entries.clear();
+        self.dir = Some(dir.to_path_buf());
+        self.set_current(None);
+        self.repeating = false;
+        self.rev += 1;
+        self.refresh()
+    }
+
     /// Resultat du scan de `dir`. Le courant reste le meme fichier : s'il manque au scan (fichier cache, ou `.mov`
-    /// rattache a une image), il est garde a sa place, ou remplace par l'image dont il est le `.mov`.
+    /// rattache a une image), il est garde a sa place, ou remplace par l'image dont il est le `.mov`. Sans courant
+    /// (dossier ouvert par `open_dir`), c'est la premiere entree.
     pub fn set_entries(&mut self, dir: &Path, entries: Vec<Entry>) -> Show<T> {
         if self.dir.as_deref() != Some(dir) {
             return Show::Keep;
@@ -286,18 +321,21 @@ impl<T: Clone> Controller<T> {
         self.entries = entries;
         self.entries.retain(|e| !self.removing.contains(&e.path));
         self.rev += 1;
-        if let Some(cur) = self.current.clone()
-            && !self.entries.iter().any(|e| e.path == cur)
-        {
-            if let Some(img) = self.entries.iter().find(|e| e.live_mov.as_ref() == Some(&cur)) {
-                let img = img.path.clone();
-                self.set_current(Some(img));
-            } else if let Some(entry) = dir::stat_entry(&cur) {
-                dir::insert_sorted(&mut self.entries, entry);
-            } else {
-                let first = self.entries.first().map(|e| e.path.clone());
-                self.set_current(first);
+        if let Some(cur) = self.current.clone() {
+            if !self.entries.iter().any(|e| e.path == cur) {
+                if let Some(img) = self.entries.iter().find(|e| e.live_mov.as_ref() == Some(&cur)) {
+                    let img = img.path.clone();
+                    self.set_current(Some(img));
+                } else if let Some(entry) = dir::stat_entry_explicit(&cur) {
+                    dir::insert_sorted(&mut self.entries, entry);
+                } else {
+                    let first = self.entries.first().map(|e| e.path.clone());
+                    self.set_current(first);
+                }
             }
+        } else {
+            let first = self.entries.first().map(|e| e.path.clone());
+            self.set_current(first);
         }
         self.refresh()
     }
@@ -378,6 +416,10 @@ impl<T: Clone> Controller<T> {
                 self.entries.get(at.min(self.entries.len().saturating_sub(1))).map(|e| e.path.clone())
             };
             self.set_current(next);
+        } else if self.current.is_none() {
+            // dossier vide (ou vide de nouveau) ou un fichier arrive : il s'affiche
+            let first = self.entries.first().map(|e| e.path.clone());
+            self.set_current(first);
         }
         self.refresh()
     }
@@ -466,8 +508,9 @@ impl<T: Clone> Controller<T> {
         let frame = match result {
             Ok(frame) => frame,
             Err(e) => {
-                let quiet = matches!(e, Error::Unsupported(_)) && !media::kind_from_path(&id.path).is_some_and(decodable);
-                let msg = if quiet { String::new() } else { format!("{} : {e}", id.path.display()) };
+                // une video sans image a montrer n'est pas une erreur ; le reste dit sa cause
+                let quiet = matches!(e, Error::Unsupported(_)) && media::detect(&id.path) == Some(MediaKind::Video);
+                let msg = if quiet { String::new() } else { failure_message(&id.path, &e) };
                 self.failed.insert((id.clone(), level), msg.clone());
                 if is_current && !self.shows(&id) {
                     self.shown = None;
@@ -673,7 +716,8 @@ pub fn decode_work(budget: usize) -> impl Fn(&Key) -> Result<Frame> + Send + Syn
 /// le resultat a `STRIP_W` x `STRIP_H`.
 pub fn thumb_work(store: Option<ThumbStore>, writer: FileOpsHandle) -> impl Fn(&Key) -> Result<Frame> + Send + Sync + 'static {
     move |key: &Key| {
-        let kind = media::kind_from_path(&key.path).ok_or_else(|| Error::Unsupported(key.path.display().to_string()))?;
+        // par contenu : un JPEG nomme `.ithmb` n'a pas de `kind_from_path`
+        let kind = media::detect(&key.path).ok_or_else(|| Error::Unsupported(key.path.display().to_string()))?;
         let entry = Entry { path: key.path.clone(), kind, live_mov: None, mtime_ns: key.mtime_ns, size: key.size };
         let want = if key.target == Target::Strip { STRIP_W.max(STRIP_H) } else { PREVIEW_WANT };
         let frame = match store.as_ref().and_then(|s| s.read(&entry, want)) {
@@ -1099,6 +1143,8 @@ mod tests {
     #[test]
     fn a_failed_decode_is_reported_and_not_retried() {
         let mut r = rig("ctl-failed", 5, 2, 256 << 20);
+        // une signature JPEG, pour que l'echec soit celui du decodeur (et pas un contenu non reconnu)
+        std::fs::write(r.dir.path().join("i02.jpg"), [0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
         let preview = r.thumbs.take("i02.jpg", Level::Preview);
         match r.c.on_result(preview, Err(Error::Decode("corrompu".into()))) {
             Show::Failed(m) => assert!(m.contains("corrompu"), "{m}"),
@@ -1172,6 +1218,95 @@ mod tests {
         }
         assert!(r.c.current().is_none());
         assert!(r.decode.jobs().is_empty() && r.thumbs.jobs().is_empty());
+    }
+
+    /// Controller sans dossier ni fichier, et ses jobs de decode.
+    fn bare() -> (Controller<Tex>, Rc<Fake>) {
+        let (decode, thumbs) = (Rc::new(Fake::default()), Rc::new(Fake::default()));
+        let c = Controller::new(256 << 20, Box::new(FakeJobs(decode.clone())), Box::new(FakeJobs(thumbs)), Box::new(|f: Frame| (f.w, f.h)));
+        (c, decode)
+    }
+
+    #[test]
+    fn an_opened_directory_shows_the_first_file_that_appears() {
+        let dir = TmpDir::new("ctl-open-dir");
+        let (mut c, decode) = bare();
+        c.set_viewport(800, 600);
+        c.open_dir(dir.path());
+        assert_eq!(c.dir(), Some(dir.path()));
+        assert!(c.current().is_none() && c.entries().is_empty());
+        // le scan d'un dossier vide ne change rien
+        c.set_entries(dir.path(), dir::list(dir.path()).unwrap());
+        assert!(c.current().is_none());
+        // un fichier arrive : c'est le courant, et son decode part
+        let p = dir.path().join("b.jpg");
+        std::fs::write(&p, b"x").unwrap();
+        c.reconcile(&p);
+        assert_eq!(name(&c), "b.jpg");
+        decode.take("b.jpg", Level::Fit);
+        // un second, avant lui dans l'ordre : le courant ne bouge pas
+        let a = dir.path().join("a.jpg");
+        std::fs::write(&a, b"x").unwrap();
+        c.reconcile(&a);
+        assert_eq!((name(&c), c.entries().len()), ("b.jpg".to_string(), 2));
+    }
+
+    #[test]
+    fn the_scan_of_an_opened_directory_adopts_its_first_entry() {
+        let dir = TmpDir::new("ctl-open-dir-scan");
+        let (mut c, _) = bare();
+        c.open_dir(dir.path());
+        for n in ["b.jpg", "a.jpg"] {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        // le scan d'un autre dossier est ignore
+        let other = TmpDir::new("ctl-open-dir-other");
+        c.set_entries(other.path(), vec![]);
+        assert!(c.current().is_none());
+        c.set_entries(dir.path(), dir::list(dir.path()).unwrap());
+        assert_eq!((name(&c), c.entries().len()), ("a.jpg".to_string(), 2));
+    }
+
+    #[test]
+    fn opening_a_file_by_content_and_refusing_one_with_its_reason() {
+        let dir = TmpDir::new("ctl-open-content");
+        let jpeg = std::fs::read(picme_core::fixtures_dir().join("a.jpg")).unwrap();
+        std::fs::write(dir.path().join("T984.ithmb"), &jpeg).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"du texte").unwrap();
+        let (mut c, _) = bare();
+        assert!(!matches!(c.open(&dir.path().join("T984.ithmb")), Show::Failed(_)));
+        assert_eq!(name(&c), "T984.ithmb");
+        let failed = |c: &mut Controller<Tex>, n: &str| match c.open(&dir.path().join(n)) {
+            Show::Failed(m) => m,
+            other => panic!("attendu un echec pour {n}, recu {other:?}"),
+        };
+        let (mut c, _) = bare();
+        assert!(failed(&mut c, "notes.txt").ends_with("notes.txt : contenu non reconnu comme média"));
+        assert!(failed(&mut c, "absent.jpg").ends_with("absent.jpg : introuvable"));
+    }
+
+    #[test]
+    fn a_failed_decode_says_why() {
+        let dir = TmpDir::new("ctl-failure-message");
+        let p = |n: &str, data: &[u8]| {
+            std::fs::write(dir.path().join(n), data).unwrap();
+            dir.path().join(n)
+        };
+        let jpeg = std::fs::read(picme_core::fixtures_dir().join("a.jpg")).unwrap();
+        // une extension d'image sur du texte : le contenu n'est pas reconnu
+        let text = p("texte.jpg", b"du texte");
+        assert_eq!(failure_message(&text, &Error::Decode("TurboJPEG".into())), format!("{} : contenu non reconnu comme média", text.display()));
+        // une signature connue qui ne se decode pas
+        let broken = p("casse.jpg", &jpeg[..20]);
+        assert!(failure_message(&broken, &Error::Decode("TurboJPEG".into())).ends_with("casse.jpg : décodage en échec (TurboJPEG)"));
+        // un format reconnu sans decodeur
+        let raw = p("x.orf", b"IIRO\x08\0\0\0 et la suite");
+        assert!(failure_message(&raw, &Error::Unsupported("RAW".into())).ends_with("x.orf : format RAW reconnu, non pris en charge par cette version"));
+        // illisible
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(failure_message(&text, &Error::Io(err)).ends_with("texte.jpg : illisible (accès refusé)"));
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(failure_message(&text, &Error::Io(gone)).ends_with("texte.jpg : introuvable"));
     }
 
     #[test]

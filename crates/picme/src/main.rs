@@ -9,6 +9,7 @@ use picme::dnd;
 use picme::fileops::{Done, FileOps, FileOpsHandle};
 use picme::filmstrip::Filmstrip;
 use picme::keys::{self, Action, Ctx};
+use picme::launch::{self, Cli};
 use picme::monitor::DirWatch;
 use picme::osd::{self, Osd};
 use picme::video::{self, Player};
@@ -147,6 +148,9 @@ impl Ui {
             }
         }
         let current = self.ctl.borrow().current().map(|e| e.path.clone());
+        if current.is_some() {
+            self.osd.unpin();
+        }
         if let Some(path) = &current {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             if self.window.title().as_deref() != Some(name.as_str()) {
@@ -167,6 +171,16 @@ impl Ui {
         self.sync();
         self.sync_turns();
         self.sync_player();
+    }
+
+    /// Dossier sans media : la fenetre est vide, le message reste jusqu'a l'arrivee d'un fichier (`apply`).
+    fn show_empty(&self, dir: &Path) {
+        let msg = launch::empty_message(dir);
+        eprintln!("picme : {msg}");
+        self.osd.pin(&msg);
+        if let Some(name) = dir.file_name() {
+            self.window.set_title(Some(&name.to_string_lossy()));
+        }
     }
 
     /// Ce que les touches voient de la vue.
@@ -640,14 +654,42 @@ fn main() {
     let trace = Trace { on: std::env::var_os("PICME_TRACE").is_some_and(|v| v == "1"), t0: Instant::now() };
     trace.mark("process start");
 
+    // l'argument d'abord : l'aide, la version et les erreurs de chemin ne demandent ni pool ni fenetre
+    let arg = match launch::parse_args(std::env::args_os().skip(1)) {
+        Ok(Cli::Help) => {
+            print!("{}", launch::USAGE);
+            return;
+        }
+        Ok(Cli::Version) => {
+            println!("{}", launch::version());
+            return;
+        }
+        Ok(Cli::Open(arg)) => arg,
+        Err(msg) => {
+            eprintln!("picme : {msg}\nusage : picme [FICHIER|DOSSIER]... (picme --help)");
+            std::process::exit(2);
+        }
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        // un chemin absolu n'a pas besoin du dossier courant (supprime sous nos pieds)
+        Err(_) if arg.as_ref().is_some_and(|a| a.is_absolute()) => PathBuf::from("/"),
+        Err(e) => {
+            eprintln!("picme : dossier courant : {}", launch::reason(&e));
+            std::process::exit(1);
+        }
+    };
+    let launch = match launch::resolve(arg.as_deref(), &cwd) {
+        Ok(l) => l,
+        Err(msg) => {
+            eprintln!("picme : {msg}");
+            std::process::exit(1);
+        }
+    };
+
     // pas de GL ni de Wayland : le backend x11 est le seul valide sous i3, et evite la negociation de backends
     // SAFETY : appele avant tout thread (les pools demarrent juste apres) et avant gtk::init()
     unsafe { std::env::set_var("GDK_BACKEND", "x11") };
-
-    let Some(arg) = std::env::args_os().nth(1).map(PathBuf::from) else {
-        eprintln!("usage : picme <image>");
-        std::process::exit(2);
-    };
 
     // pools et thread d'ecriture avant gtk::init : le Preview de argv[1] se decode pendant l'init GTK
     let (tx, rx) = async_channel::unbounded::<(Key, picme_core::Result<Frame>)>();
@@ -673,7 +715,29 @@ fn main() {
     ));
     let decode_pool = Pool::new("picme-decode", pool::decode_threads(), app::decode_work(budget), tx);
     let mut ctl = Controller::new(budget, Box::new(decode_pool), Box::new(thumbs_pool.clone()), Box::new(canvas::texture_of));
-    if let Show::Failed(msg) = ctl.open(&arg) {
+    // un fichier donne s'affiche ; sinon le premier media du dossier, trouve sans attendre le listing complet (le
+    // scan ci-dessous le rend), et un dossier sans media s'ouvre vide, surveille
+    let mut empty = false;
+    let opened = match &launch.file {
+        Some(file) => ctl.open(file),
+        None => match dir::first(&launch.dir) {
+            Ok(dir::First::Found(first)) => {
+                trace.mark("first entry found");
+                ctl.open(&first.path)
+            }
+            Ok(dir::First::Empty) => {
+                empty = true;
+                ctl.open_dir(&launch.dir)
+            }
+            // trop de fichiers a extension inconnue pour trancher a bon compte : le scan dira (premier media, ou vide)
+            Ok(dir::First::Undecided) => ctl.open_dir(&launch.dir),
+            Err(e) => {
+                eprintln!("picme : {} : {}", launch.dir.display(), launch::reason(&e));
+                std::process::exit(1);
+            }
+        },
+    };
+    if let Show::Failed(msg) = opened {
         eprintln!("picme : {msg}");
         std::process::exit(1);
     }
@@ -777,6 +841,12 @@ fn main() {
         scan_tx,
     });
     ui.watch_dir();
+    if empty {
+        ui.show_empty(&launch.dir);
+    } else if let Some(notice) = &launch.notice {
+        eprintln!("picme : {notice}");
+        ui.osd.message(notice);
+    }
 
     dnd::attach_source(
         &canvas,
@@ -864,6 +934,9 @@ fn main() {
                         let n = list.len();
                         let show = ui.ctl.borrow_mut().set_entries(&d, list);
                         ui.apply(show);
+                        if n == 0 && ui.ctl.borrow().dir() == Some(d.as_path()) {
+                            ui.show_empty(&d);
+                        }
                         ui.trace.mark(&format!("scan : {n} entrees"));
                     }
                     Err(e) => eprintln!("picme : {} : {e}", d.display()),
